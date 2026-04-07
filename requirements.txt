@@ -1,0 +1,26 @@
+# --- Core AI & Agentic Framework ---
+# Used for the ReAct state machine and reasoning loops
+langchain>=0.3.0
+langgraph>=0.2.0
+langchain-community>=0.3.0
+pydantic>=2.10.0
+
+# --- Infrastructure & Sandboxing ---
+# Required for Python to talk to Docker Desktop
+docker>=7.1.0
+python-dotenv>=1.0.1
+
+# --- Testing & Code Validation ---
+# The agent uses this to check if its "healed" code actually works
+pytest>=8.3.0
+
+# --- Connectivity & API ---
+# For communicating with your local Ollama instance
+requests>=2.32.0
+
+# --- Data Science & Dissertation Evaluation ---
+# For calculating SR and IE metrics and plotting graphs in notebooks
+numpy>=2.1.0
+pandas>=2.2.0
+matplotlib>=3.9.0
+ipykernel>=6.29.0
