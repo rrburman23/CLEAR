@@ -18,6 +18,7 @@ WORKSPACE_DIR = os.path.abspath(
 # Ensure the workspace exists
 os.makedirs(WORKSPACE_DIR, exist_ok=True)
 
+
 @tool
 def read_file(filename: str) -> str:
     """
@@ -42,7 +43,7 @@ def read_file(filename: str) -> str:
 def write_file(filename: str, content: str) -> str:
     """
     Overwrites a Python file in the workspace with new content.
-    Used to apply  ealed code.
+    Used to apply healed code.
 
     Args:
         filename (str): The name of the file to write to.
@@ -55,17 +56,42 @@ def write_file(filename: str, content: str) -> str:
         return f"Success: Successfully updated '{filename}'."
     except Exception as e:
         return f"Error writing file: {str(e)}"
-    
+
+
+@tool
+def run_repair_attempt(code: str, test_suite: str) -> str:
+    """
+    Executes a code snippet against a test suite in an isolated sandbox.
+    Use this for atomic testing where you pass the code and tests as strings.
+
+    Args:
+        code: The Python code to repair.
+        test_suite: The Python test code used to verify the repair.
+
+    Returns:
+        The output of the test suite (Pass/Fail/Traceback).
+    """
+    # Combine code and tests into one script
+    full_script = f"{code}\n\n{test_suite}\n\n# Execution complete"
+
+    # Use tool_sandbox, not 'manager'
+    result = tool_sandbox.run_code(full_script)
+
+    if result["status"] == "success":
+        return f"SUCCESS: All tests passed!\n{result['output']}"
+    else:
+        return f"FAILURE: Tests failed with error:\n{result.get('error', result.get('message'))}"
+
 
 @tool
 def execute_test_suite() -> str:
     """
     Executes the pytest test suite against the current workspace.
-    Use this tool to verify if the applied code modifications successfully resolve the issue.
+    Use this to verify if the applied code modifications successfully resolve the issue.
 
     Returns:
-        str: The standard output of the test runner, including pass/fail metrics and tracebacks.
-    """ # type: ignore
+        str: The standard output of the test runner.
+    """
     result = tool_sandbox.run_workspace_tests(WORKSPACE_DIR)
 
     if result["status"] == "success":

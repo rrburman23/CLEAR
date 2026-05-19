@@ -3,6 +3,7 @@
 langchain>=0.3.0
 langgraph>=0.2.0
 langchain-community>=0.3.0
+langchain-ollama>=0.2.0
 pydantic>=2.10.0
 
 # --- Infrastructure & Sandboxing ---

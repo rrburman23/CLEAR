@@ -1,16 +1,65 @@
 """
 Logic module for the CLEAR agent state machine.
-Implements a production-grade message-based ReAct loop with native tool binding.
+Implements a message-based ReAct loop with native tool binding,
+system prompt injection, and forced-action logic for local SLMs via Ollama.
 """
 
+import os
+from dotenv import load_dotenv
 from typing import Annotated, Sequence
 from typing_extensions import TypedDict
+
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import SystemMessage, BaseMessage, AIMessage, HumanMessage
 from langgraph.prebuilt import ToolNode
+from langchain_ollama import ChatOllama
 
-from src.tools.agent_tools import read_file, write_file, execute_test_suite
+# Import the custom tools we built for the CLEAR framework
+from src.tools.agent_tools import (
+    read_file,
+    write_file,
+    execute_test_suite,
+    run_repair_attempt,
+)
+
+# Load environment configuration
+load_dotenv()
+
+# --- MASTER SYSTEM PROMPT ---
+SYSTEM_PROMPT = """
+You are CLEAR, an autonomous, senior software engineering agent.
+Your primary objective is to debug, heal, and verify Python code.
+
+You have access to a secure, isolated workspace and the following tools:
+1. `read_file(filename: str)`: Inspect the contents of a file.
+2. `write_file(filename: str, content: str)`: Overwrite a file with corrected code.
+3. `execute_test_suite()`: Run the test suite to verify if the code works.
+
+CRITICAL RULES FOR TOOL CALLING:
+- NEVER write JSON tool calls manually in your text response. You MUST use the official tool calling API.
+- NEVER guess the code. ALWAYS call `execute_test_suite` first, read the error traceback, and then call `read_file` on the EXACT filename mentioned in the error.
+- DO NOT invent file paths. If the error says `test_math_ops.py`, the filename is just `test_math_ops.py`.
+- ALWAYS verify your fixes by running `execute_test_suite` again.
+- ABORT IF YOU TYPE JSON: You are physically incapable of executing tools by typing JSON dictionaries in your chat response. You MUST use the underlying API binding. Outputting raw JSON like {"name": "read_file"} will cause a fatal system crash.
+
+CRITICAL RULE: 
+- Before declaring "Repair complete", you MUST confirm that the test suite reports "0 failed".
+- If the test suite shows multiple failures, you MUST address each one iteratively. 
+- NEVER GENERATE CODE FROM MEMORY. If you see a file mentioned in an error, 
+  you are strictly forbidden from writing code for it until you have called `read_file`. 
+
+EXAMPLE WORKFLOW:
+1. You call `execute_test_suite`.
+2. Tool returns an error in `math_ops.py`.
+3. You call `read_file` with argument filename="math_ops.py".
+4. You analyze the code, then call `write_file` with the corrected code.
+5. You call `execute_test_suite` again to verify.
+6. Once the test passes, you output: "Repair complete."
+"""
+
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+USE_REAL_LLM = os.getenv("USE_REAL_LLM", "False").lower() == "true"
 
 
 # 1. Define State with Message Tracking
@@ -24,102 +73,101 @@ class AgentState(TypedDict):
 
 
 # 2. Gather and Bind Tools
-tools = [read_file, write_file, execute_test_suite]
+tools = [read_file, write_file, execute_test_suite, run_repair_attempt]
 tool_node = ToolNode(tools)
 
 
-# --- MOCK LLM FOR INTEGRATION TESTING ---
-class MockLLM:
-    """Simulates an LLM producing tool calls and messages based on history."""
+# 3. Initialize the Core Reasoning Engine
+if USE_REAL_LLM:
+    print(f"🔗 Connecting to Local Ollama at {OLLAMA_BASE_URL}...")
+    llm_engine = ChatOllama(
+        base_url=OLLAMA_BASE_URL, model="llama3.1", temperature=0.0
+    ).bind_tools(tools)
+else:
+    print("⚠️ Using MockLLM (Real LLM disabled in .env)")
 
-    def __init__(self):
-        self.call_count = 0
+    class MockLLM:
+        def __init__(self):
+            self.call_count = 0
 
-    def __call__(self, state: AgentState) -> dict:
-        self.call_count += 1
-        history = state["messages"]
+        def invoke(self, messages) -> AIMessage:
+            self.call_count += 1
+            if self.call_count == 1:
+                return AIMessage(
+                    content="Need to check files.",
+                    tool_calls=[
+                        {
+                            "name": "read_file",
+                            "args": {"filename": "math_ops.py"},
+                            "id": "1",
+                        }
+                    ],
+                )
+            return AIMessage(content="Repair complete.")
 
-        # Determine the agent state based on the last message in history
-        last_message = history[-1] if history else None
-
-        # Loop Cycle 1: Agent decides to read the file to locate the bug
-        if self.call_count == 1:
-            return {
-                "role": "assistant",
-                "content": "I need to inspect the workspace files to check for faults.",
-                "tool_calls": [
-                    {
-                        "name": "read_file",
-                        "args": {"filename": "math_ops.py"},
-                        "id": "call_read_01",
-                    }
-                ],
-            }
-
-        # Loop Cycle 2: Agent analyzes file contents and triggers a test suite execution
-        elif self.call_count == 2:
-            return {
-                "role": "assistant",
-                "content": "I see the file. Let me execute the test suite to observe failures.",
-                "tool_calls": [
-                    {"name": "execute_test_suite", "args": {}, "id": "call_test_01"}
-                ],
-            }
-
-        # Loop Cycle 3: Agent acts on test suite outcomes (terminates or addresses errors)
-        else:
-            return {
-                "role": "assistant",
-                "content": "The test suite confirms all modules are functioning optimally. Repair phase complete.",
-                "tool_calls": [],
-            }
+    llm_engine = MockLLM()
 
 
-# Instantiate the engine
-llm_engine = MockLLM()
-
-
-# 3. Define Graph Nodes
+# 4. Define Graph Nodes
 def call_model(state: AgentState):
-    """Executes the core reasoning node using the message history."""
-    response = llm_engine(state)
+    """Executes the core reasoning node with forced action constraints."""
+    messages = state["messages"]
 
-    # Cast raw mock output into LangChain-compatible message dict format
-    from langchain_core.messages import AIMessage
+    # Prepend System Prompt to ensure it is always in context
+    if not isinstance(messages[0], SystemMessage):
+        messages = [SystemMessage(content=SYSTEM_PROMPT)] + list(messages)
 
-    ai_msg = AIMessage(content=response["content"], tool_calls=response["tool_calls"])
-    return {"messages": [ai_msg]}
+    response = llm_engine.invoke(messages)
+
+    # FORCED ACTION: If model produces text only (no tools) and isn't finished,
+    # force a reminder back to the model to maintain agentic momentum.
+    response_content = getattr(response, "content", "")
+    response_text = str(response_content).lower()
+    if not response.tool_calls and "repair complete" not in response_text:
+        reminder = HumanMessage(
+            content="CRITICAL: You are in a reasoning loop but haven't called a tool. You must use a tool to progress."
+        )
+        return {"messages": [response, reminder]}
+
+    return {"messages": [response]}
 
 
 def should_continue(state: AgentState):
-    """Evaluates conditional routing thresholds based on the last model execution."""
+    """
+    Routes the graph:
+    - continue: To the ToolNode
+    - end: Terminate the graph
+    """
     last_message = state["messages"][-1]
 
-    # If the model didn't request any tools, it has arrived at its conclusion
-    if not getattr(last_message, "tool_calls", None):
+    # If tools were requested, route to the tool node
+    if getattr(last_message, "tool_calls", None):
+        return "continue"
+
+    # Termination logic
+    content = getattr(last_message, "content", "")
+    content_text = str(content).lower()
+    if any(
+        keyword in content_text for keyword in ["repair complete", "all tests pass"]
+    ):
         return "end"
 
-    # Otherwise, route processing directly to the tool execution block
+    # Otherwise loop back
     return "continue"
 
 
-# 4. Synthesize the Directed Acyclic Graph (DAG)
+# 5. Synthesize the Directed Acyclic Graph (DAG)
 workflow = StateGraph(AgentState)
 
-# Define processing nodes
 workflow.add_node("agent", call_model)
 workflow.add_node("tools", tool_node)
 
-# Define operational paths
 workflow.set_entry_point("agent")
 
-# Set up conditional routing out of the agent node
 workflow.add_conditional_edges(
     "agent", should_continue, {"continue": "tools", "end": END}
 )
 
-# Loop the tool outputs back into the reasoning core
 workflow.add_edge("tools", "agent")
 
-# Compile framework
 clear_agent = workflow.compile()

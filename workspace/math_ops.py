@@ -1,5 +1,7 @@
-"""Target module for arithmetic operations."""
+"""Module for arithmetic operations."""
 
-def add_numbers(a: int, b: int) -> int:
-    """Returns the sum of two integers."""
-    return a + b  # Fixed logic fault
+
+def calculate_power(base: int, exponent: int) -> int:
+    """Returns the base raised to the power of the exponent."""
+    # BUG: Returns multiplication instead of exponentiation
+    return base ** exponent
