@@ -2,6 +2,5 @@
 
 
 def reverse_string(text: str) -> str:
-    """Returns the reversed version of the input string."""
-    # BUG: Returns the original string instead of reversing it
+    """Return the reversed version of the input string."""
     return text

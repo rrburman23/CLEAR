@@ -10,9 +10,9 @@ RUN apt-get update && apt-get upgrade -y && apt-get clean && rm -rf /var/lib/apt
 # Install pytest so the agent can run tests against its code
 RUN pip install --no-cache-dir pytest
 
-# Create a non-root user for security (The agent shouldn't have 'sudo' in the sandbox)
+# Create a non-root user for security
 RUN useradd -m agent
 USER agent
 
-# Default command
-CMD ["python"]
+# Keep the container alive in the background waiting for the AI's commands
+CMD ["sleep", "infinity"]

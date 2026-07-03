@@ -2,6 +2,5 @@
 
 
 def calculate_power(base: int, exponent: int) -> int:
-    """Returns the base raised to the power of the exponent."""
-    # BUG: Returns multiplication instead of exponentiation
-    return base ** exponent
+    """Return the base raised to the power of the exponent."""
+    return base**exponent
