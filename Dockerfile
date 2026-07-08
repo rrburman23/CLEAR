@@ -1,14 +1,15 @@
-# Use a lightweight Python image
 FROM python:3.12-slim
 
 # Set the working directory inside the container
 WORKDIR /app
 
 # Update system packages to patch vulnerabilities
-RUN apt-get update && apt-get upgrade -y && apt-get clean && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
 
-# Install pytest so the agent can run tests against its code
-RUN pip install --no-cache-dir pytest
+# Install only the Python dependencies we need
+COPY requirements.txt ./
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt pytest
 
 # Create a non-root user for security
 RUN useradd -m agent
