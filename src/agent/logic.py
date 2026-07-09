@@ -58,31 +58,14 @@ from langchain_ollama import ChatOllama
 from src.tools.agent_tools import run_repair_attempt
 
 
+from src.utils.config import OLLAMA_BASE_URL, MODEL_NAME, USE_REAL_LLM
+from src.utils.parsers import extract_json
+
 # ==========================================================
 # Environment
 # ==========================================================
 
 load_dotenv()
-
-
-OLLAMA_BASE_URL = os.getenv(
-    "OLLAMA_BASE_URL",
-    "http://localhost:11434"
-)
-
-MODEL_NAME = os.getenv(
-    "CLEAR_MODEL",
-    "qwen2.5-coder:7b"
-)
-
-USE_REAL_LLM = (
-    os.getenv(
-        "USE_REAL_LLM",
-        "false"
-    ).lower()
-    == "true"
-)
-
 
 # ==========================================================
 # System Prompt
@@ -211,37 +194,6 @@ else:
     llm_engine = MockLLM()
 
 
-
-# ==========================================================
-# JSON Extraction
-# ==========================================================
-
-
-def extract_json(text: str):
-    """
-    Extract JSON from model output.
-    Robustly handles trailing braces and markdown fences.
-    """
-    text = text.strip()
-    text = re.sub(r"```json|```", "", text).strip()
-    
-    start = text.find("{")
-    end = text.rfind("}")
-    
-    if start == -1 or end == -1:
-        return None
-        
-    candidate = text[start:end+1]
-    
-    # Robust parsing: LLMs frequently hallucinate extra closing braces
-    while candidate and candidate.endswith("}"):
-        try:
-            return json.loads(candidate, strict=False)
-        except Exception:
-            # Strip the last character and try again
-            candidate = candidate[:-1].strip()
-            
-    return None
 
 
 

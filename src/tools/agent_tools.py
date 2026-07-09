@@ -18,6 +18,7 @@ import os
 
 from src.core.sandbox import SandboxManager
 from src.utils.terminal import success, failure
+from src.utils.config import WORKSPACE_DIR
 
 
 # ---------------------------------------------------------------------
@@ -26,17 +27,11 @@ from src.utils.terminal import success, failure
 
 tool_sandbox = SandboxManager()
 
-
 # ---------------------------------------------------------------------
 # Workspace configuration
 # ---------------------------------------------------------------------
 
-WORKSPACE_DIR = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "../../workspace")
-)
-
 os.makedirs(WORKSPACE_DIR, exist_ok=True)
-
 
 # ---------------------------------------------------------------------
 # Security helper
@@ -128,17 +123,17 @@ def run_repair_attempt(code: str, test_suite: str) -> str:
         SUCCESS if tests pass.
         FAILURE with traceback otherwise.
     """
-    print("\n" + "=" * 60)
-    print("CLEAR REPAIR ATTEMPT")
-    print("=" * 60)
+    #print("\n" + "=" * 60)
+    #print("CLEAR REPAIR ATTEMPT")
+    #print("=" * 60)
 
-    print("\n--- GENERATED CODE ---")
-    print(code)
+    #print("\n--- GENERATED CODE ---")
+    #print(code)
 
-    print("\n--- TEST SUITE ---")
-    print(test_suite)
+    #print("\n--- TEST SUITE ---")
+    #print(test_suite)
 
-    print("=" * 60)
+    #print("=" * 60)
     
     try:
         result = tool_sandbox.execute(
