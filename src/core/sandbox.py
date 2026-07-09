@@ -1,107 +1,202 @@
+"""
+CLEAR Docker Sandbox Manager
+
+Responsible for:
+- Executing LLM-generated repair candidates safely.
+- Running generated tests inside an isolated Docker container.
+- Preventing host execution of machine-generated code.
+- Returning structured execution results to the agent.
+
+Architecture:
+
+LLM
+ |
+ v
+run_repair_attempt()
+ |
+ v
+SandboxManager.execute()
+ |
+ v
+Docker container
+ |
+ v
+SUCCESS / FAILURE
+"""
+
+import tempfile
+from pathlib import Path
+from dataclasses import dataclass
+
 import docker
 from docker import errors
-import os
-from pathlib import Path
+
+
+# ---------------------------------------------------------------------
+# Execution Result Object
+# ---------------------------------------------------------------------
+
+
+@dataclass
+class SandboxResult:
+    """
+    Structured result returned after sandbox execution.
+
+    Attributes:
+        success:
+            True if the repair passes all tests.
+
+        output:
+            stdout produced by the container.
+
+        error:
+            stderr or execution failure information.
+    """
+
+    success: bool
+    output: str = ""
+    error: str = ""
+
+
+# ---------------------------------------------------------------------
+# Sandbox Manager
+# ---------------------------------------------------------------------
 
 
 class SandboxManager:
+    """
+    Manages ephemeral Docker containers for secure code execution.
+
+    Security properties:
+    - Generated code never executes on the host.
+    - Containers are deleted after execution.
+    - Network access is disabled.
+    - Memory usage is restricted.
+    - Files are mounted read-only.
+    """
+
     def __init__(self):
+        """
+        Connect to Docker daemon and configure execution image.
+        """
+
         self.client = docker.from_env()
+
+        # Docker image containing Python execution environment
         self.image_name = "clear-executor:latest"
 
-    def run_code(self, code: str, timeout: int = 5):
+    # -----------------------------------------------------------------
+    # Main execution entry point
+    # -----------------------------------------------------------------
+
+    def execute(
+        self,
+        code: str,
+        test_suite: str,
+    ) -> SandboxResult:
         """
-        Spins up an ephemeral container, executes the code,
-        and returns stdout/stderr.
+        Execute a candidate repair against its test suite.
+
+        Creates an isolated temporary directory:
+
+            /tmp/random_id/
+                target.py
+                temp_script.py
+
+        target.py:
+            Contains the repaired implementation.
+
+        temp_script.py:
+            Contains tests supplied by CLEAR.
+
+        The container executes:
+
+            python /app/temp_script.py
+
+        The test script imports:
+
+            from target import function
+
+        and verifies correctness.
         """
-        with open("temp_script.py", "w", encoding="utf-8") as f:
-            f.write(code)
 
-        try:
-            local_script_path = str(Path("temp_script.py").resolve().as_posix())
+        # -------------------------------------------------------------
+        # Create temporary workspace
+        # -------------------------------------------------------------
 
-            # Removed 'timeout' keyword parameter to comply with Docker SDK constraints
-            container_output = self.client.containers.run(
-                image=self.image_name,
-                command="python /app/temp_script.py",
-                volumes={
-                    local_script_path: {"bind": "/app/temp_script.py", "mode": "ro"}
-                },
-                working_dir="/app",
-                detach=False,
-                stdout=True,
-                stderr=True,
-                remove=True,
-                network_disabled=True,
-                mem_limit="128m",
-            )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
 
-            if isinstance(container_output, bytes):
-                output_str = container_output.decode("utf-8")
-            else:
-                output_str = str(container_output or "")
+            target_file = temp_path / "target.py"
+            test_file = temp_path / "temp_script.py"
 
-            return {"status": "success", "output": output_str}
+            # Write repaired code
+            target_file.write_text(code, encoding="utf-8")
 
-        except errors.ContainerError as e:
-            if isinstance(e.stderr, bytes):
-                error_str = e.stderr.decode("utf-8")
-            else:
-                error_str = str(e.stderr or "")
+            # Write validation tests
+            test_file.write_text(test_suite, encoding="utf-8")
 
-            return {"status": "failed", "error": error_str}
+            try:
+                # -----------------------------------------------------
+                # Execute inside Docker
+                # -----------------------------------------------------
 
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
+                container_output = self.client.containers.run(
+                    image=self.image_name,
+                    # Run test suite inside container
+                    command="python /app/temp_script.py",
+                    # Mount temporary files
+                    volumes={
+                        str(temp_path.resolve()): {
+                            "bind": "/app",
+                            "mode": "ro",
+                        }
+                    },
+                    working_dir="/app",
+                    # Security restrictions
+                    network_disabled=True,
+                    mem_limit="128m",
+                    # Automatically delete container
+                    remove=True,
+                    # Capture output
+                    stdout=True,
+                    stderr=True,
+                )
 
-        finally:
-            if os.path.exists("temp_script.py"):
-                os.remove("temp_script.py")
+                # Docker returns bytes normally
+                output_text = (
+                    container_output.decode("utf-8")
+                    if isinstance(container_output, bytes)
+                    else str(container_output)
+                )
 
-    def run_workspace_tests(self, workspace_path: str) -> dict:
-        """
-        Mounts the target workspace into the container and executes pytest.
+                return SandboxResult(
+                    success=True,
+                    output=output_text,
+                )
 
-        Args:
-            workspace_path (str): Absolute path to the local directory containing code and tests.
+            # ---------------------------------------------------------
+            # Python/test failure inside container
+            # ---------------------------------------------------------
 
-        Returns:
-            dict: Execution status and formatted stdout/stderr payload.
-        """
-        try:
-            local_dir = str(Path(workspace_path).resolve().as_posix())
+            except errors.ContainerError as e:
+                error_text = (
+                    e.stderr.decode("utf-8")
+                    if isinstance(e.stderr, bytes)
+                    else str(e.stderr or "")
+                )
 
-            # Removed 'timeout' parameter to address the Docker-py signature mismatch
-            container_output = self.client.containers.run(
-                image=self.image_name,
-                command="pytest /workspace -p no:cacheprovider -v",
-                volumes={local_dir: {"bind": "/workspace", "mode": "ro"}},
-                working_dir="/workspace",
-                detach=False,
-                stdout=True,
-                stderr=True,
-                remove=True,
-                network_disabled=True,
-                mem_limit="256m",
-            )
+                return SandboxResult(
+                    success=False,
+                    error=error_text,
+                )
 
-            output_str = (
-                container_output.decode("utf-8")
-                if isinstance(container_output, bytes)
-                else str(container_output or "")
-            )
-            return {"status": "success", "output": output_str}
+            # ---------------------------------------------------------
+            # Docker configuration failure
+            # ---------------------------------------------------------
 
-        except errors.ContainerError as e:
-            error_str = (
-                e.stderr.decode("utf-8")
-                if isinstance(e.stderr, bytes)
-                else str(e.stderr or "")
-            )
-            return {"status": "failed", "error": error_str}
-
-        except Exception as e:
-            return {
-                "status": "error",
-                "message": f"Sandbox configuration fault: {str(e)}",
-            }
+            except Exception as e:
+                return SandboxResult(
+                    success=False,
+                    error=str(e),
+                )

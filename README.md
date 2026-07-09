@@ -1,117 +1,326 @@
 # CLEAR: Closed-Loop Engine for Autonomous Repair
-**Author:** Rohan Burman | **MSc Artificial Intelligence**, Queen Mary University of London
+
+**Author:** Rohan Burman
+**Programme:** MSc Artificial Intelligence, Queen Mary University of London
+
+---
 
 ## 📖 Overview
-CLEAR is a localized, autonomous software engineering agent designed to safely generate, compile, test, and self-heal code without external dependencies. Moving beyond passive text-completion paradigms, CLEAR utilizes a **Hybrid Orchestrator** architecture to decouple deterministic host-system operations from probabilistic Small Language Model (SLM) inference.
 
-By constraining the agent to an "Atomic Logic Engine," the framework eliminates navigational hallucinations and state-space exhaustion. The agent autonomously executes its generated abstract syntax trees (AST) within an ephemeral, air-gapped Docker sandbox, iterating on standard error tracebacks until the code passes validation.
+CLEAR (Closed-Loop Engine for Autonomous Repair) is a local autonomous software repair framework that investigates the ability of Small Language Models (SLMs) to automatically detect, modify, and verify faulty Python programs.
+
+Unlike traditional code completion systems, CLEAR implements a **closed-loop repair architecture** where the language model is not trusted to simply generate a solution. Instead, the agent must:
+
+1. Analyse the provided faulty program.
+2. Generate a candidate repair.
+3. Execute the repair attempt inside a controlled validation environment.
+4. Observe test feedback.
+5. Iterate until the supplied verification suite passes or the repair budget is exhausted.
+
+The system uses a **Hybrid Orchestrator architecture**, separating deterministic program execution and validation from probabilistic model reasoning.
+
+CLEAR is designed around the principle that autonomous repair agents should be evaluated through verified execution rather than generated code quality alone.
+
+---
 
 ## 🚀 Core Features
 
-- **Hybrid Orchestrator**: Separates deterministic host-level file I/O (Python) from probabilistic reasoning (LLM) to maximize context-window efficiency.
-- **Ephemeral Sandboxing**: A "containment-first" approach using resource-throttled, network-disabled Docker containers to safely execute agent-generated code without risking the host OS.
-- **Linter-Fallback Mechanism**: A deterministic static analysis interceptor that preempts recursive agent loops caused by unparseable structural syntax errors.
-- **Local Sovereignty**: Optimized for local inference using Ollama, ensuring absolute data privacy, GDPR compliance, and zero API dependency.
+### Hybrid Agent Orchestration
+
+CLEAR separates:
+
+- **Deterministic operations**
+  - File handling
+  - Test execution
+  - Verification
+  - Benchmark management
+  - Metric collection
+
+from:
+
+- **Probabilistic reasoning**
+  - Fault analysis
+  - Code modification
+  - Repair strategy generation
+
+The orchestration layer is implemented using LangGraph, providing controlled state transitions and bounded repair iterations.
+
+### Closed-Loop Verification
+
+Repairs are only considered successful when:
+
+1. The generated code is applied.
+2. The validation suite executes successfully.
+3. The repaired program passes all tests.
+
+A model response alone is never considered a successful repair.
+
+### Local Small Language Model Inference
+
+CLEAR supports local inference through Ollama, allowing experiments without external API calls.
+
+Advantages:
+
+- No cloud dependency
+- Reproducible experiments
+- Reduced privacy concerns
+- Offline-compatible evaluation
+
+Currently evaluated models include:
+
+- qwen2.5-coder
+- deepseek-coder
+- codegemma
+- codellama
+- llama3.1
+- gemma2
+- mistral-nemo
+- phi3
+
+### Automated Benchmark Framework
+
+CLEAR includes a benchmark suite designed around common software fault categories:
+
+```
+tests/
+└── benchmarks/
+    ├── logic/
+    │   ├── factorial/
+    │   ├── fibonacci/
+    │   └── sort/
+    │
+    ├── syntax/
+    │   ├── missing_colon/
+    │   └── unterminated_string/
+    │
+    ├── exception/
+    │   ├── divide/
+    │   └── json/
+    │
+    ├── api/
+    ├── security/
+    ├── data_structure/
+    └── edge_case/
+```
+
+Each benchmark contains:
+
+```
+benchmark_name/
+├── target.py   # intentionally faulty program
+└── test_x.py   # validation oracle
+```
+
+---
 
 ## 📁 Project Structure
 
-```plaintext
-CLEAR/
-├── src/
-│   ├── agent/            # LangGraph state machine, Linter-Fallback, and reasoning logic
-│   ├── core/             # Docker SDK orchestration and sandbox management
-│   ├── tools/            # Agent-invocable Python tools and Docker SDK interaction
-│   └── main.py           # CLI entry point (Hybrid Orchestrator)
-├── tests/
-│   └── benchmarks/       # Empirical fault taxonomy dataset (Logic, Syntax, Exception)
-├── Dockerfile            # Secure ephemeral execution environment blueprint
-├── run_benchmarks.py     # Automated evaluation pipeline for comparative analysis
-└── requirements.txt      # Python dependencies
 ```
+CLEAR/
+│
+├── src/
+│   ├── agent/
+│   │   └── logic.py         # LangGraph repair agent
+│   │
+│   ├── core/
+│   │   └── sandbox management
+│   │
+│   ├── tools/
+│   │   └── repair execution tools
+│   │
+│   ├── utils/
+│   │   └── terminal formatting utilities
+│   │
+│   └── main.py               # CLEAR repair CLI
+│
+├── tests/
+│   ├── benchmarks/            # fault taxonomy dataset
+│   └── logs/                  # experiment logs
+│
+├── Dockerfile                 # execution environment
+├── run_benchmarks.py          # evaluation pipeline
+├── requirements.txt
+└── README.md
+```
+
+---
 
 ## 🛠️ Prerequisites
 
-- **Docker Desktop**: Mandatory for the isolated execution sandbox.
-- **Ollama**: For serving local models.
-- **Python 3.10+**
+Required:
 
-## ⚙️ Installation & Setup
+- Python 3.10+
+- Docker Desktop
+- Ollama
 
-1. **Clone the Repository**
+Recommended:
+
+- NVIDIA GPU for faster local inference
+
+---
+
+## ⚙️ Installation
+
+### 1. Clone Repository
 
 ```bash
 git clone https://github.com/rrburman23/CLEAR.git
 cd CLEAR
 ```
 
-2. **Initialize Virtual Environment**
+### 2. Create Virtual Environment
+
+**Windows:**
 
 ```bash
 python -m venv .venv
+.venv\Scripts\activate
+```
 
-# Windows
-.\.venv\Scripts\activate
+**Linux/macOS:**
 
-# macOS/Linux
+```bash
+python -m venv .venv
 source .venv/bin/activate
 ```
 
-3. **Install Dependencies & CLI Tool**
+### 3. Install Dependencies
 
 ```bash
 pip install -e .
 ```
 
-4. **Build the Execution Sandbox**
+### 4. Install Local Model
 
-```bash
-docker build -t clear-executor .
-```
-
-5. **Prepare the Reasoning Core**
-
-*(Note: Empirical evaluation demonstrated Qwen2.5-Coder to be the most effective model for this architecture.)*
+Example:
 
 ```bash
 ollama pull qwen2.5-coder:7b
 ```
 
-## 💻 Usage Instructions
+---
 
-### 1. Single-File Autonomous Repair
+## 💻 Usage
 
-You can use the CLEAR CLI tool to autonomously repair any Python file, provided it has a corresponding test suite to act as the verification oracle.
+### Single Repair Experiment
 
-```bash
-clear-repair --code path/to/broken_code.py --test path/to/test_suite.py
-```
-
-### 2. Run the Empirical Benchmark Suite
-
-To replicate the evaluation data presented in the dissertation, run the automated benchmarking pipeline. This will test the agent against a taxonomy of Logic, Syntax, and Exception faults.
+CLEAR can repair an individual Python program:
 
 ```bash
-python run_benchmarks.py
+python -m src.main \
+  --code path/to/broken_program.py \
+  --test path/to/test_suite.py
 ```
 
-## 📊 Evaluation Metrics
+Example:
 
-The framework's performance was evaluated against three distinct fault taxonomies using local SLMs. The automated pipeline captures the following metrics:
+```bash
+python -m src.main \
+  --code tests/benchmarks/logic/factorial/target.py \
+  --test tests/benchmarks/logic/factorial/test_logic.py
+```
 
-### 1. Success Rate ($S_R$)
+Successful repairs produce:
 
-The percentage of bugs successfully resolved within the graph recursion limit ($K_{max}$).
+```
+Benchmark: logic:factorial
 
-$$S_R = \frac{1}{N}\sum_{i=1}^{N} \mathbb{1}(k_i \leq K_{max})$$
+REPAIR_SUCCESS | Benchmark=logic:factorial
+Successfully overwritten target.py
+```
 
-### 2. Mean Time to Resolution ($TTR$)
+Failed repairs include a failure reason:
 
-The average execution time required for the agent to resolve the fault, verify it against the oracle, and terminate the graph.
+```
+REPAIR_FAILED |
+Benchmark=edge_case:duplicates |
+Reason=Verification failed: sandbox tests did not pass
+```
 
-### 3. Iteration Efficiency ($I_E$)
+---
 
-A metric to evaluate the reasoning precision of the model, calculated by tracking the total number of tool calls ($k$) required for successful runs.
+## 📊 Benchmark Evaluation
 
-$$I_E = \frac{1}{N_{success}}\sum_{i=1}^{N_{success}} \frac{1}{k_i}$$
+Run the complete benchmark suite:
 
-*Developed as a Master's Research Project at Queen Mary University of London, 2026.*
+```bash
+python -m run_benchmarks
+```
+
+Specific models:
+
+```bash
+python -m run_benchmarks --models qwen2.5-coder:7b
+```
+
+Specific categories:
+
+```bash
+python -m run_benchmarks --types logic exception
+```
+
+---
+
+## 📈 Evaluation Metrics
+
+CLEAR records:
+
+- Repair success
+- Failure reason
+- Time to resolution
+- Number of repair iterations
+- Model performance by benchmark category
+
+### Success Rate ($S_R$)
+
+Percentage of benchmarks successfully repaired:
+
+$$
+S_R = \frac{N_{successful}}{N_{total}} \times 100
+$$
+
+### Mean Time To Resolution ($TTR$)
+
+Average time required for a successful repair:
+
+$$
+TTR = \frac{\sum T_i}{N_{successful}}
+$$
+
+where $T_i$ is the repair execution time for benchmark $i$.
+
+### Iteration Efficiency ($I_E$)
+
+Measures repair precision based on tool usage:
+
+$$
+I_E = \frac{1}{N_{successful}} \sum_{i=1}^{N_{successful}} \frac{1}{k_i}
+$$
+
+where $k_i$ is the number of repair iterations for benchmark $i$. Higher values indicate fewer repair attempts.
+
+---
+
+## 🔎 Failure Analysis
+
+CLEAR records unsuccessful repairs using structured failure categories, for example:
+
+- Verification failed: sandbox tests did not pass
+- No CLEAR_RESULT returned
+- Repair generated but code was not applied
+- Agent terminated without verified fix
+
+This allows evaluation beyond simple pass/fail rates by analysing where models fail.
+
+---
+
+## 📝 Research Context
+
+CLEAR was developed as an MSc Artificial Intelligence research project at Queen Mary University of London.
+
+The project investigates whether locally deployed Small Language Models can perform reliable autonomous software repair through controlled execution, verification, and iterative feedback.
+
+Developed by **Rohan Burman**
+MSc Artificial Intelligence
+Queen Mary University of London
+2026

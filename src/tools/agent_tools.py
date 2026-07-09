@@ -1,104 +1,174 @@
 """
-Tool abstractions for the CLEAR agent.
-These functions are exposed to the LLM, allowing it to interact with the file system.
+CLEAR Agent Tools
+
+LangGraph tools exposed to the repair agent.
+
+Available tools:
+- read_file()
+- write_file()
+- run_repair_attempt()
+
+The LLM cannot execute code directly.
+All execution is delegated to SandboxManager.
 """
 
 from langchain_core.tools import tool
-import os
-from src.core.sandbox import SandboxManager
 
-# Initialize an instance of the sandbox for the tools to utilize
+import os
+
+from src.core.sandbox import SandboxManager
+from src.utils.terminal import success, failure
+
+
+# ---------------------------------------------------------------------
+# Sandbox instance
+# ---------------------------------------------------------------------
+
 tool_sandbox = SandboxManager()
 
-# Define the workspace so the agent can't accidentally read/write outside of the project
+
+# ---------------------------------------------------------------------
+# Workspace configuration
+# ---------------------------------------------------------------------
+
 WORKSPACE_DIR = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "../../workspace")
 )
 
-# Ensure the workspace exists
 os.makedirs(WORKSPACE_DIR, exist_ok=True)
+
+
+# ---------------------------------------------------------------------
+# Security helper
+# ---------------------------------------------------------------------
+
+
+def _is_safe_path(filename: str) -> str:
+    """
+    Ensures file access stays inside workspace.
+
+    Prevents:
+        ../../secret.txt
+
+    from escaping the workspace directory.
+    """
+
+    requested_path = os.path.abspath(os.path.join(WORKSPACE_DIR, filename))
+
+    workspace = os.path.abspath(WORKSPACE_DIR)
+
+    # Safer than startswith()
+    if os.path.commonpath([requested_path, workspace]) != workspace:
+        raise ValueError(f"Security Violation: Access denied to {filename}")
+
+    return requested_path
+
+
+# ---------------------------------------------------------------------
+# File reading tool
+# ---------------------------------------------------------------------
 
 
 @tool
 def read_file(filename: str) -> str:
     """
-    Reads the contents of a Python file from the local workspace.
-    Used to inspect code before attempting a repair.
-
-    Args:
-        filename (str): The name of the file to read (e.g., 'app.py')
+    Reads a Python file from the CLEAR workspace.
     """
-    filepath = os.path.join(WORKSPACE_DIR, filename)
-    if not os.path.exists(filepath):
-        return f"Error: File '{filename}' not found in workspace."
 
     try:
+        filepath = _is_safe_path(filename)
+
+        if not os.path.exists(filepath):
+            return f"Error: File '{filename}' not found."
+
         with open(filepath, "r", encoding="utf-8") as f:
             return f.read()
+
     except Exception as e:
-        return f"Error reading file: {str(e)}"
+        return f"Error: {str(e)}"
+
+
+# ---------------------------------------------------------------------
+# File writing tool
+# ---------------------------------------------------------------------
 
 
 @tool
 def write_file(filename: str, content: str) -> str:
     """
-    Overwrites a Python file in the workspace with new content.
-    Used to apply healed code.
-
-    Args:
-        filename (str): The name of the file to write to.
-        content (str): The full Python code to save.
+    Writes repaired code into workspace.
     """
-    filepath = os.path.join(WORKSPACE_DIR, filename)
+
     try:
+        filepath = _is_safe_path(filename)
+
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(content)
-        return f"Success: Successfully updated '{filename}'."
+
+        return f"Success: Updated '{filename}'."
+
     except Exception as e:
-        return f"Error writing file: {str(e)}"
+        return f"Error: {str(e)}"
+
+
+# ---------------------------------------------------------------------
+# Repair execution tool
+# ---------------------------------------------------------------------
 
 
 @tool
 def run_repair_attempt(code: str, test_suite: str) -> str:
     """
-    Executes a code snippet against a test suite in an isolated sandbox.
-    Use this for atomic testing where you pass the code and tests as strings.
+    Executes a candidate repair.
 
-    Args:
-        code: The Python code to repair.
-        test_suite: The Python test code used to verify the repair.
+    The generated code is executed ONLY inside
+    the Docker sandbox.
 
     Returns:
-        The output of the test suite (Pass/Fail/Traceback).
+        SUCCESS if tests pass.
+        FAILURE with traceback otherwise.
     """
-    # Combine code and tests into one script
-    full_script = f"{code}\n\n{test_suite}\n\n# Execution complete"
+    print("\n" + "=" * 60)
+    print("CLEAR REPAIR ATTEMPT")
+    print("=" * 60)
 
-    # Use tool_sandbox, not 'manager'
-    result = tool_sandbox.run_code(full_script)
+    print("\n--- GENERATED CODE ---")
+    print(code)
 
-    if result["status"] == "success":
-        return f"SUCCESS: All tests passed!\n{result['output']}"
-    else:
-        return f"FAILURE: Tests failed with error:\n{result.get('error', result.get('message'))}"
+    print("\n--- TEST SUITE ---")
+    print(test_suite)
 
-
-@tool
-def execute_test_suite() -> str:
-    """
-    Executes the pytest test suite against the current workspace.
-    Use this to verify if the applied code modifications successfully resolve the issue.
-
-    Returns:
-        str: The standard output of the test runner.
-    """
-    result = tool_sandbox.run_workspace_tests(WORKSPACE_DIR)
-
-    if result["status"] == "success":
-        return f"Test Suite Passed:\n{result['output']}"
-    elif result["status"] == "failed":
-        return f"Test Suite Failed:\n{result['error']}"
-    else:
-        return (
-            f"System Error executing tests:\n{result.get('message', 'Unknown Error')}"
+    print("=" * 60)
+    
+    try:
+        result = tool_sandbox.execute(
+            code=code,
+            test_suite=test_suite,
         )
+        
+        print("\n--- SANDBOX RESULT ---")
+        print(result.success)
+
+        print(result.output)
+        print(result.error)
+        
+        if result.success:
+
+            success(
+                "Sandbox verification passed."
+            )
+
+            return "SUCCESS: All tests pass."
+
+
+        failure(
+            "Sandbox verification failed."
+        )
+
+        return (
+            "FAILURE\n"
+            f"{result.error}"
+        )
+
+    except Exception as e:
+        return f"FAILURE\nSandbox execution error: {str(e)}"

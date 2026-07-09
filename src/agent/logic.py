@@ -1,283 +1,434 @@
 """
-Logic module for the CLEAR agent state machine.
-Implements a message-based ReAct loop with native tool binding,
-system prompt injection, and forced-action logic for local SLMs.
-Optimized for Atomic Repair execution.
+CLEAR Agent Logic Module
+
+Implements the LangGraph ReAct repair loop.
+
+Architecture:
+
+    Human
+      |
+      v
+    CLEAR Agent
+      |
+      v
+ run_repair_attempt()
+      |
+      v
+ Docker Sandbox
+      |
+      v
+ Test Result
+      |
+      v
+    CLEAR Agent
+      |
+      v
+ Verified Repair
+
+The LLM never executes code directly.
+All execution occurs inside SandboxManager.
 """
 
 import os
 import re
 import json
+import uuid
+import sys
+
+from typing import Any, Annotated, Sequence
+
+from typing_extensions import TypedDict
 
 from dotenv import load_dotenv
-from typing import Annotated, Sequence
-from typing_extensions import TypedDict
 
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
+
 from langchain_core.messages import (
-    SystemMessage,
     BaseMessage,
-    AIMessage,
+    SystemMessage,
     HumanMessage,
+    AIMessage,
     ToolMessage,
 )
-from langgraph.prebuilt import ToolNode
+
 from langchain_ollama import ChatOllama
 
-# Import ONLY the atomic tool to strictly constrain the agent's action space
 from src.tools.agent_tools import run_repair_attempt
 
-# Load environment configuration
+
+# ==========================================================
+# Environment
+# ==========================================================
+
 load_dotenv()
 
-# --- MASTER SYSTEM PROMPT (ATOMIC REPAIR) ---
-SYSTEM_PROMPT = """You are CLEAR, an autonomous software engineering agent.
-Your primary objective is to debug, heal, and verify Python code.
 
-You operate in an atomic execution environment and have access to exactly ONE tool:
-1. `run_repair_attempt(code: str, test_suite: str)`: Executes code against tests in an isolated sandbox.
+OLLAMA_BASE_URL = os.getenv(
+    "OLLAMA_BASE_URL",
+    "http://localhost:11434"
+)
 
-CRITICAL RULES:
-- You DO NOT have file system access. Do not attempt to read or write files.
-- The human will provide you with the failing source code and the verification test suite.
-- You MUST use the `run_repair_attempt` tool to validate your logic fixes.
-- DO NOT output any raw text, conversational filler, or markdown blocks before calling the tool. Output ONLY the tool call.
-- If the tool returns a FAILURE, analyze the captured traceback and call the tool again with updated code.
-- ONLY when the tool returns SUCCESS (All tests passed), you must output exactly: "Repair complete."
+MODEL_NAME = os.getenv(
+    "CLEAR_MODEL",
+    "qwen2.5-coder:7b"
+)
+
+USE_REAL_LLM = (
+    os.getenv(
+        "USE_REAL_LLM",
+        "false"
+    ).lower()
+    == "true"
+)
+
+
+# ==========================================================
+# System Prompt
+# ==========================================================
+
+
+SYSTEM_PROMPT = """
+
+You are CLEAR, an autonomous Python repair agent.
+
+Your task:
+
+Repair the broken target.py program.
+
+You have exactly one tool:
+
+run_repair_attempt(
+    code,
+    test_suite
+)
+
+Rules:
+
+- code MUST contain ONLY repaired target.py.
+- test_suite MUST remain unchanged.
+- Never put implementation code inside test_suite.
+- Never modify tests.
+- Never use markdown.
+- Never explain before tool calls.
+
+Workflow:
+
+1. Analyse the bug.
+2. Call run_repair_attempt.
+3. Read the execution result.
+4. If failed:
+      fix the code
+      retry.
+5. If successful:
+
+Reply exactly:
+
+Repair complete.
+
 """
 
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-USE_REAL_LLM = os.getenv("USE_REAL_LLM", "False").lower() == "true"
-model_name = os.getenv("CLEAR_MODEL", "qwen2.5-coder:7b")
 
-# --- ARCHITECTURE COMPATIBILITY CHECK ---
-# Identify if the active model natively supports Ollama's tool-calling API
-NATIVE_TOOL_MODELS = ["qwen2.5", "llama3.1", "mistral-nemo"]
-SUPPORTS_NATIVE_TOOLS = any(kw in model_name.lower() for kw in NATIVE_TOOL_MODELS)
+# ==========================================================
+# State
+# ==========================================================
 
 
-# 1. Define State with Message Tracking
 class AgentState(TypedDict):
-    """
-    Represents the unified state tracker for the CLEAR framework.
-    Utilizes add_messages to append new interactions to the historical sequence.
-    """
 
-    messages: Annotated[Sequence[BaseMessage], add_messages]
+    messages: Annotated[
+            Sequence[BaseMessage],
+            add_messages
+        ]
 
 
-# 2. Gather and Bind Tools
-tools = [run_repair_attempt]
-tool_node = ToolNode(tools)
+# ==========================================================
+# Tools
+# ==========================================================
 
-# 3. Initialize the Core Reasoning Engine
+
+TOOLS = [
+    run_repair_attempt
+]
+
+
+tool_node = ToolNode(TOOLS)
+
+
+
+# ==========================================================
+# LLM
+# ==========================================================
+
+
+SUPPORTED_TOOL_MODELS = [
+    "qwen2.5",
+    "llama3.1",
+    "mistral"
+]
+
+
+SUPPORTS_NATIVE_TOOLS = any(
+    x in MODEL_NAME.lower()
+    for x in SUPPORTED_TOOL_MODELS
+)
+
+
+
 if USE_REAL_LLM:
-    print(
-        f"🔗 Connecting to Local Ollama at {OLLAMA_BASE_URL} with model: {model_name}..."
+
+    base_llm = ChatOllama(
+        model=MODEL_NAME,
+        base_url=OLLAMA_BASE_URL,
+        temperature=0
     )
-    base_llm = ChatOllama(base_url=OLLAMA_BASE_URL, model=model_name, temperature=0.0)
+
+
     if SUPPORTS_NATIVE_TOOLS:
-        llm_engine = base_llm.bind_tools(tools)
+
+        llm_engine = base_llm.bind_tools(
+            TOOLS
+        )
+
     else:
-        print("⚠️ Architecture lacks native tool support. Engaging JSON Polyfill...")
+
         llm_engine = base_llm
+
+
 else:
-    print("⚠️ Using MockLLM (Real LLM disabled in .env)")
+
 
     class MockLLM:
-        def __init__(self):
-            self.call_count = 0
 
-        def invoke(self, messages) -> AIMessage:
-            self.call_count += 1
-            if self.call_count == 1:
-                return AIMessage(
-                    content="",
-                    tool_calls=[
-                        {
-                            "name": "run_repair_attempt",
-                            "args": {
-                                "code": "def add(a, b): return a + b",
-                                "test_suite": "assert add(1, 1) == 2",
-                            },
-                            "id": "mock_call_1",
-                        }
-                    ],
-                )
-            return AIMessage(content="Repair complete.")
+        def invoke(self, messages):
+
+            return AIMessage(
+                content="Repair complete."
+            )
+
 
     llm_engine = MockLLM()
 
 
-def _extract_code_and_tests(text: str) -> tuple[str | None, str | None]:
-    """Extract the current broken code and its validation tests from the prompt."""
-    code_match = re.search(
-        r"Here is the current broken source code:\s*```python\s*(.*?)\s*```",
-        text,
-        re.DOTALL,
-    )
-    test_match = re.search(
-        r"Here is the validation test suite:\s*```python\s*(.*?)\s*```",
-        text,
-        re.DOTALL,
-    )
-    code = code_match.group(1).strip() if code_match else None
-    tests = test_match.group(1).strip() if test_match else None
-    return code, tests
+
+# ==========================================================
+# JSON Extraction
+# ==========================================================
 
 
-def _repair_code_fallback(original_code: str, tool_output: str) -> str | None:
-    """Apply deterministic repair hints when the model struggles with SyntaxErrors."""
-    repaired_code = original_code
-
-    if "SyntaxError" in tool_output and "for" in original_code:
-        repaired_code = re.sub(
-            r"for (.*) in (.*)(?<!:)$",
-            r"for \1 in \2:",
-            repaired_code,
-            flags=re.MULTILINE,
-        )
-
-    if "retun" in repaired_code:
-        repaired_code = repaired_code.replace("retun", "return")
-
-    if "evens.append(num" in repaired_code:
-        repaired_code = repaired_code.replace("evens.append(num", "evens.append(num)")
-
-    return repaired_code if repaired_code != original_code else None
-
-
-# 4. Define Graph Nodes
-def call_model(state: AgentState):
-    """Executes the core reasoning node with forced action constraints."""
-    messages = list(state["messages"])
-
-    # Dynamically inject JSON instructions for legacy models
-    dynamic_system_prompt = SYSTEM_PROMPT
-    if not SUPPORTS_NATIVE_TOOLS:
-        dynamic_system_prompt += """
-NOTE: Your architecture does not support native API tool binding.
-To execute the tool, you MUST output a raw JSON block in this exact format:
-```json
-{
-    "name": "run_repair_attempt",
-    "args": {
-        "code": "print('fixed code')",
-        "test_suite": "def test_func(): pass"
-    }
-}
-
-Output NOTHING else besides this JSON block.
-"""
-
-
-    if messages and isinstance(messages[0], SystemMessage):
-        messages[0] = SystemMessage(content=dynamic_system_prompt)
-    else:
-        messages.insert(0, SystemMessage(content=dynamic_system_prompt))
-
-    response = llm_engine.invoke(messages)
-    response_content = str(getattr(response, "content", "")).lower()
-
-    # --- JSON SHIM FOR NON-NATIVE MODELS ---
-    # Manually parse raw JSON strings and simulate a LangChain native tool call
-    if not SUPPORTS_NATIVE_TOOLS and not getattr(response, "tool_calls", None):
+def extract_json(text: str):
+    """
+    Extract JSON from model output.
+    Robustly handles trailing braces and markdown fences.
+    """
+    text = text.strip()
+    text = re.sub(r"```json|```", "", text).strip()
+    
+    start = text.find("{")
+    end = text.rfind("}")
+    
+    if start == -1 or end == -1:
+        return None
+        
+    candidate = text[start:end+1]
+    
+    # Robust parsing: LLMs frequently hallucinate extra closing braces
+    while candidate and candidate.endswith("}"):
         try:
-            json_match = re.search(r"\{.*\}", str(response.content), re.DOTALL)
-            if json_match:
-                parsed_data = json.loads(json_match.group(0))
-                args = parsed_data.get("args", parsed_data)
-
-                if "code" in args and "test_suite" in args:
-                    response.tool_calls = [
-                        {
-                            "name": "run_repair_attempt",
-                            "args": {
-                                "code": args["code"],
-                                "test_suite": args["test_suite"],
-                            },
-                            "id": "polyfill_call_1",
-                        }
-                    ]
+            return json.loads(candidate, strict=False)
         except Exception:
-            pass  # Fall through to the reminder logic below
+            # Strip the last character and try again
+            candidate = candidate[:-1].strip()
+            
+    return None
 
-    if getattr(response, "tool_calls", None):
-        return {"messages": [response]}
 
-    if "repair complete" in response_content:
-        return {"messages": [response]}
 
-    # Check for Linter Fallback conditions
-    last_message = messages[-1] if messages else None
-    if isinstance(last_message, ToolMessage):
-        tool_output = str(getattr(last_message, "content", ""))
-        code, _ = _extract_code_and_tests(
-            str(
-                next(
-                    (m.content for m in reversed(messages) if isinstance(m, HumanMessage)),
-                    "",
+# ==========================================================
+# Tool Call Normalisation
+# ==========================================================
+
+
+def normalise_call(call):
+
+    if isinstance(call, dict):
+
+        return (
+            call.get("name"),
+            call.get(
+                "args",
+                call.get(
+                    "arguments",
+                    {}
                 )
             )
         )
-        if code:
-            repaired_code = _repair_code_fallback(code, tool_output)
-            if repaired_code:
-                final_response = AIMessage(
-                    content=f"```python\n{repaired_code}\n```\n\nRepair complete."
-                )
-                return {"messages": [final_response]}
 
-    # Ensure the loop proceeds even if the model failed to output anything usable
-    prompt_code, prompt_tests = _extract_code_and_tests(
-        str(
-            next((m.content for m in reversed(messages) if isinstance(m, HumanMessage)), "")
+
+    return (
+        getattr(call,"name",""),
+        getattr(call,"args",{})
+    )
+
+
+
+# ==========================================================
+# Agent Node
+# ==========================================================
+
+
+def call_model(state:AgentState):
+
+
+    messages = list(
+        state["messages"]
+    )
+
+
+    if not messages or not isinstance(
+        messages[0],
+        SystemMessage
+    ):
+
+        messages.insert(
+            0,
+            SystemMessage(
+                content=SYSTEM_PROMPT
+            )
         )
+
+
+    response = llm_engine.invoke(
+        messages
     )
-    if prompt_code and prompt_tests:
-        tool_call = {
-            "name": "run_repair_attempt",
-            "args": {"code": prompt_code, "test_suite": prompt_tests},
-            "id": "repair_call_1",
-        }
-        return {"messages": [AIMessage(content="", tool_calls=[tool_call])]}
-
-    reminder = HumanMessage(
-        content="CRITICAL: You generated text but failed to invoke `run_repair_attempt`. Output ONLY the tool call JSON."
-    )
-    return {"messages": [response, reminder]}
 
 
-def should_continue(state: AgentState):
-    """Routes the graph based on the explicit state of the last message."""
-    last_message = state["messages"][-1]
+    # --------------------------------------
+    # JSON compatibility layer
+    # --------------------------------------
 
-    if isinstance(last_message, HumanMessage):
+    # If the model didn't trigger native tools, ALWAYS check the text for a JSON block
+    if not getattr(response, "tool_calls", None):
+        payload = extract_json(str(response.content))
+        if payload:
+            args = payload.get("arguments", payload.get("args", {}))
+            response = AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "run_repair_attempt", "args": args, "id": "json-tool"}
+                ],
+            )
+    
+
+    if os.getenv("DEBUG"):
+
+        print(
+            "DEBUG TOOL CALLS:",
+            response.tool_calls,
+            file=sys.stderr
+        )
+
+
+    return {
+        "messages":
+            [response]
+    }
+
+
+
+# ==========================================================
+# Routing
+# ==========================================================
+
+
+def should_continue(state):
+    """
+    Graph Router
+    """
+    last = state["messages"][-1]
+
+    if isinstance(last, HumanMessage):
         return "agent"
 
-    if getattr(last_message, "tool_calls", None):
-        return "tools"
+    # If the AI generated a tool call, route to the tool
+    if isinstance(last, AIMessage):
+        if getattr(last, "tool_calls", None):
+            return "tools"
 
-    content_text = str(getattr(last_message, "content", "")).lower()
-    if any(
-        keyword in content_text
-        for keyword in ["repair complete", "all tests pass", "success"]
-    ):
-        return "end"
+        content = str(getattr(last, "content", "")).lower()
+        # ONLY check for "repair complete".
+        # DO NOT check for "success" because the test suite contains print("SUCCESS")!
+        if "repair complete" in content:
+            return "end"
+
+        return "agent"
+
+    # If the tool just ran, ALWAYS route back to the agent so it can read the result
+    if isinstance(last, ToolMessage):
+        return "agent"
 
     return "agent"
 
 
-# 5. Synthesize the Directed Acyclic Graph (DAG)
-workflow = StateGraph(AgentState)
-workflow.add_node("agent", call_model)
-workflow.add_node("tools", tool_node)
-workflow.set_entry_point("agent")
-workflow.add_conditional_edges(
-    "agent",
-    should_continue,
-    {"tools": "tools", "agent": "agent", "end": END},
+
+# ==========================================================
+# Graph Construction
+# ==========================================================
+
+
+workflow = StateGraph(
+    AgentState
 )
-workflow.add_edge("tools", "agent")
+
+
+workflow.add_node(
+    "agent",
+    call_model
+)
+
+
+workflow.add_node(
+    "tools",
+    tool_node
+)
+
+
+
+workflow.set_entry_point(
+    "agent"
+)
+
+
+
+workflow.add_conditional_edges(
+
+    "agent",
+
+    should_continue,
+
+    {
+
+        "tools":
+            "tools",
+
+        "agent":
+            "agent",
+
+        "end":
+            END
+
+    }
+
+)
+
+
+
+workflow.add_edge(
+    "tools",
+    "agent"
+)
+
+
+
 clear_agent = workflow.compile()
