@@ -16,6 +16,7 @@ from src.utils.terminal import (
     success,
     failure,
     warning,
+    info
 )
 
 
@@ -212,7 +213,7 @@ def run_evaluation_pipeline():
 
     K_MAX = 15
 
-    setup_logging(models_to_test, args.types)
+    log_file_path = setup_logging(models_to_test, args.types)
 
     logging.info("=" * 70)
     logging.info("CLEAR BENCHMARK EXPERIMENT")
@@ -270,7 +271,7 @@ def run_evaluation_pipeline():
     # =====================================================
 
     for model in models_to_test:
-        logging.info(f"\nEvaluating model: {model}")
+        info(f"\nEvaluating model: {model}")
 
         for root, dirs, files in os.walk(benchmarks_dir):
             if "target.py" not in files:
@@ -468,14 +469,14 @@ def run_evaluation_pipeline():
     # Final Results Matrix
     # =====================================================
 
-    logging.info("\n================ FINAL PERFORMANCE MATRIX ================")
+    info("\n================ FINAL PERFORMANCE MATRIX ================")
 
     # ADD THIS HEADER ROW BACK IN:
-    logging.info(
+    info(
         f"{'Model':<22} | {'SR':>7} | {'TTR':>7} | {'IE':>7} | {'ARI':>6} | {'FR':>7}"
     )
 
-    logging.info("-" * 80)
+    info("-" * 80)
 
     # =====================================================
     # Calculate and display metrics
@@ -532,16 +533,24 @@ def run_evaluation_pipeline():
         else:
             failure(result)
 
-    logging.info("=" * 80)
-    logging.info("\n================ FAILURE ANALYSIS ================")
+    info("=" * 80)
+    info("\n================ FAILURE ANALYSIS ================")
 
     for model, stats in model_aggregates.items():
         if stats["failure_reasons"]:
-            logging.info(f"\n{model}")
+            info(f"\nModel: {model}")
 
             for reason, count in stats["failure_reasons"].items():
-                logging.info(f"  {reason}: {count}")
-
+                # Clean up the output if the reason is a long string
+                clean_reason = reason.strip().split("\n")[0][:60]
+                info(f"  - {clean_reason}: {count} occurrences")
+        elif stats["total"] > 0:
+            success(f"\nModel: {model}\n  - No failures recorded. Perfect run!")
+    info("====================================================\n")
+    
+    info(f"\nBenchmark evaluation completed. Logs saved to: {log_file_path}")
+    info("=" * 80)
+    info("=" * 80 + "\n")
 
 # =========================================================
 # Program Entry Point
