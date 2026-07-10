@@ -218,3 +218,4 @@ __marimo__/
 # Experiment outputs
 tests/logs/
 .log
+*.csv
