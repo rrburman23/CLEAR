@@ -250,8 +250,8 @@ YOUR DIRECTIVE:
                 status = "SUCCESS"
                 failure_reason = None
                 success(f"REPAIR_SUCCESS | Benchmark={benchmark_name}")
-                
-                # Generate a diff patch for the repaired code 
+
+                # Generate a diff patch for the repaired code
                 patch = generate_patch(
                     broken_code, healed_code, os.path.basename(target_file)
                 )

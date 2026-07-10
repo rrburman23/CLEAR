@@ -20,18 +20,21 @@ from src.utils.result_export import export_results
 # =========================================================
 
 AVAILABLE_MODELS = [
-    # Code specialised models
+    # 1. State-of-the-Art Code Specialists
     "qwen2.5-coder:7b",
-    "deepseek-coder:6.7b",
+    "granite-code:8b",
+    # 2. Legacy/Corporate Code Baselines
     "codegemma:7b",
     "codellama:7b",
-    # General purpose models
+    # 3. Dense Generalist Models
     "llama3.1:8b",
     "gemma2:9b",
     "mistral-nemo:12b",
-    # Small resource-efficient models
-    "qwen2.5-coder:3b",
+    # 4. Intrinsic Reasoning (Test-Time Compute)
+    "deepseek-r1:8b",
+    # 5. The "Cognitive Floor" (Resource-Efficient)
     "phi3:mini",
+    "qwen2.5-coder:3b",
 ]
 
 
@@ -44,7 +47,7 @@ AVAILABLE_TYPES = [
     "exception",
     "logic",
     "oop",
-    "pythonsecurity",
+    "security",
     "syntax",
 ]
 
@@ -174,8 +177,20 @@ def extract_clear_result(output: str):
 def run_evaluation_pipeline():
 
     parser = create_parser()
-
     args = parser.parse_args()
+
+    # =====================================================
+    # GLOBAL STATE RESET
+    # =====================================================
+    # Forcefully revert any lingering fixed files back to
+    # their intentionally broken Git state before starting.
+    try:
+        subprocess.run(
+            ["git", "restore", "tests/benchmarks/"], check=False, capture_output=True
+        )
+        info("Global state reset: All benchmarks restored to their broken Git state.")
+    except Exception as e:
+        warning(f"Could not run global git restore: {e}")
 
     # =====================================================
     # Model Selection
@@ -397,13 +412,21 @@ def run_evaluation_pipeline():
                 logging.error(f"Execution error: {error}")
 
             finally:
-                # Restore original bug.
-                #
-                # This guarantees every
-                # experiment starts fairly.
-
-                with open(target_file, "w", encoding="utf-8") as file:
-                    file.write(original_code)
+                # =================================================
+                # HARD STATE RESTORATION
+                # =================================================
+                # Writing cached memory back to disk is dangerous if the
+                # cache was already polluted. Git restore is absolute.
+                try:
+                    subprocess.run(
+                        ["git", "restore", target_file],
+                        check=False,
+                        capture_output=True,
+                    )
+                except Exception:
+                    # Fallback to in-memory restore if Git is unavailable
+                    with open(target_file, "w", encoding="utf-8") as file:
+                        file.write(original_code)
 
             # =================================================
             # Collect Metrics

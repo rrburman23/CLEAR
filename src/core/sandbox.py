@@ -3,25 +3,9 @@ CLEAR Docker Sandbox Manager
 
 Responsible for:
 - Executing LLM-generated repair candidates safely.
-- Running generated tests inside an isolated Docker container.
+- Running the human-authored pytest oracle inside an isolated container.
 - Preventing host execution of machine-generated code.
-- Returning structured execution results to the agent.
-
-Architecture:
-
-LLM
- |
- v
-run_repair_attempt()
- |
- v
-SandboxManager.execute()
- |
- v
-Docker container
- |
- v
-SUCCESS / FAILURE
+- Returning structured execution results (with full output) to the agent.
 """
 
 import tempfile
@@ -43,14 +27,9 @@ class SandboxResult:
     Structured result returned after sandbox execution.
 
     Attributes:
-        success:
-            True if the repair passes all tests.
-
-        output:
-            stdout produced by the container.
-
-        error:
-            stderr or execution failure information.
+        success: True only if the pytest oracle exits 0 (all tests pass).
+        output:  Combined stdout + stderr from the container (always populated).
+        error:   Convenience copy of output when success is False.
     """
 
     success: bool
@@ -72,80 +51,52 @@ class SandboxManager:
     - Containers are deleted after execution.
     - Network access is disabled.
     - Memory usage is restricted.
-    - Files are mounted read-only.
+    - A hard timeout prevents unbounded hangs.
     """
 
-    def __init__(self):
-        """
-        Connect to Docker daemon and configure execution image.
-        """
-
+    def __init__(self, timeout_seconds: int = 60):
         self.client = docker.from_env()
-
-        # Docker image containing Python execution environment
         self.image_name = "clear-executor:latest"
+        self.timeout_seconds = timeout_seconds
 
     # -----------------------------------------------------------------
     # Main execution entry point
     # -----------------------------------------------------------------
 
-    def execute(
-        self,
-        code: str,
-        test_suite: str,
-    ) -> SandboxResult:
+    def execute(self, code: str, test_suite: str) -> SandboxResult:
         """
-        Execute a candidate repair against its test suite.
+        Execute a candidate repair against its pytest oracle.
 
-        Creates an isolated temporary directory:
+        Workspace layout inside the container (/app):
 
-            /tmp/random_id/
-                target.py
-                temp_script.py
+            target.py         repaired implementation
+            test_target.py    the human-authored pytest oracle
 
-        target.py:
-            Contains the repaired implementation.
-
-        temp_script.py:
-            Contains tests supplied by CLEAR.
-
-        The container executes:
-
-            python /app/temp_script.py
-
-        The test script imports:
-
-            from target import function
-
-        and verifies correctness.
+        The oracle imports `from target import ...`, so target.py must sit
+        alongside it on the import path (working_dir=/app handles this).
         """
-
-        # -------------------------------------------------------------
-        # Create temporary workspace
-        # -------------------------------------------------------------
 
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
 
             target_file = temp_path / "target.py"
-            test_file = temp_path / "temp_script.py"
+            # Name it test_*.py so pytest auto-discovers it.
+            test_file = temp_path / "test_target.py"
 
-            # Write repaired code
             target_file.write_text(code, encoding="utf-8")
-
-            # Write validation tests
             test_file.write_text(test_suite, encoding="utf-8")
 
+            container = None
             try:
-                # -----------------------------------------------------
-                # Execute inside Docker
-                # -----------------------------------------------------
-
-                container_output = self.client.containers.run(
+                # Run DETACHED so we can capture the exit code AND the full
+                # logs (stdout+stderr) regardless of pass/fail. `-p no:cacheprovider`
+                # keeps the read-only mount from tripping over .pytest_cache.
+                container = self.client.containers.run(
                     image=self.image_name,
-                    # Run test suite inside container
-                    command="python /app/temp_script.py",
-                    # Mount temporary files
+                    command=(
+                        "python -m pytest test_target.py "
+                        "-q --no-header -p no:cacheprovider"
+                    ),
                     volumes={
                         str(temp_path.resolve()): {
                             "bind": "/app",
@@ -153,50 +104,78 @@ class SandboxManager:
                         }
                     },
                     working_dir="/app",
-                    # Security restrictions
                     network_disabled=True,
-                    mem_limit="128m",
-                    # Automatically delete container
-                    remove=True,
-                    # Capture output
+                    mem_limit="256m",
+                    detach=True,
                     stdout=True,
                     stderr=True,
                 )
 
-                # Docker returns bytes normally
-                output_text = (
-                    container_output.decode("utf-8")
-                    if isinstance(container_output, bytes)
-                    else str(container_output)
-                )
+                try:
+                    exit_status = container.wait(timeout=self.timeout_seconds)
+                except Exception:
+                    # Timed out or the daemon connection dropped: treat as failure.
+                    try:
+                        container.kill()
+                    except Exception:
+                        pass
+                    logs = self._safe_logs(container)
+                    return SandboxResult(
+                        success=False,
+                        output=logs,
+                        error=(logs or "Execution timed out")
+                        + f"\n[CLEAR] Killed after {self.timeout_seconds}s timeout.",
+                    )
 
-                return SandboxResult(
-                    success=True,
-                    output=output_text,
-                )
+                exit_code = exit_status.get("StatusCode", 1)
+                logs = self._safe_logs(container)
 
-            # ---------------------------------------------------------
-            # Python/test failure inside container
-            # ---------------------------------------------------------
+                if exit_code == 0:
+                    return SandboxResult(success=True, output=logs)
+
+                return SandboxResult(success=False, output=logs, error=logs)
 
             except errors.ContainerError as e:
-                error_text = (
-                    e.stderr.decode("utf-8")
-                    if isinstance(e.stderr, bytes)
-                    else str(e.stderr or "")
-                )
+                # Fallback path (shouldn't normally trigger in detached mode).
+                detail = ""
+                if e.stderr:
+                    detail = (
+                        e.stderr.decode("utf-8")
+                        if isinstance(e.stderr, bytes)
+                        else str(e.stderr)
+                    )
+                return SandboxResult(success=False, output=detail, error=detail)
 
-                return SandboxResult(
-                    success=False,
-                    error=error_text,
+            except errors.ImageNotFound:
+                msg = (
+                    f"Docker image '{self.image_name}' not found. "
+                    "Build it first (see Dockerfile)."
                 )
-
-            # ---------------------------------------------------------
-            # Docker configuration failure
-            # ---------------------------------------------------------
+                return SandboxResult(success=False, output=msg, error=msg)
 
             except Exception as e:
-                return SandboxResult(
-                    success=False,
-                    error=str(e),
-                )
+                return SandboxResult(success=False, output=str(e), error=str(e))
+
+            finally:
+                if container is not None:
+                    try:
+                        container.remove(force=True)
+                    except Exception:
+                        pass
+
+    # -----------------------------------------------------------------
+    # Helpers
+    # -----------------------------------------------------------------
+
+    @staticmethod
+    def _safe_logs(container) -> str:
+        """Pull combined stdout+stderr from a container, tolerant of errors."""
+        try:
+            raw = container.logs(stdout=True, stderr=True)
+            return (
+                raw.decode("utf-8", errors="replace")
+                if isinstance(raw, bytes)
+                else str(raw)
+            )
+        except Exception as exc:
+            return f"[CLEAR] Could not retrieve container logs: {exc}"

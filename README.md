@@ -35,7 +35,7 @@ The framework evaluates models across eleven fault categories: syntax errors, lo
 
 CLEAR consists of four major components arranged in an autonomous feedback loop:
 
-```
+```text
         ┌────────────────────┐
         │   Small Language   │
         │  Model  (Ollama)   │
@@ -78,7 +78,7 @@ The orchestration layer uses LangGraph to provide controlled state transitions, 
 
 ### Closed-Loop Repair Process
 
-```
+```text
 Faulty Program → Fault Analysis → Generate Repair → Apply Code Change
       ▲                                                    │
       │                                                    ▼
@@ -114,15 +114,15 @@ Models evaluated:
 
 CLEAR contains a manually designed benchmark taxonomy. Each benchmark is a directory containing an intentionally faulty implementation (`target.py`) and a verification oracle (`test_*.py`):
 
-```
+```text
 benchmark_name/
-├── target.py     # intentionally faulty implementation
-└── test_x.py     # verification oracle
+├── target.py                  # intentionally faulty implementation
+└── test_benchmark_name.py     # verification oracle
 ```
 
 ### Benchmark Categories
 
-```
+```text
 tests/benchmarks/
 ├── logic/            factorial, fibonacci, prime, palindrome,
 │                     average, max, sort, temperature
@@ -147,7 +147,7 @@ tests/benchmarks/
 
 ## Project Structure
 
-```
+```text
 CLEAR/
 ├── src/
 │   ├── agent/
@@ -169,6 +169,7 @@ CLEAR/
 ├── workspace/                  # sandbox working directory
 ├── Dockerfile                  # execution environment
 ├── run_benchmarks.py           # evaluation pipeline
+├── run_benchmarks.bat          # repeated-run wrapper (Windows)
 ├── pyproject.toml
 └── README.md
 ```
@@ -187,14 +188,14 @@ Recommended: NVIDIA GPU for faster local inference.
 
 ### Setup
 
-**1. Clone the repository**
+#### 1. Clone the repository
 
 ```bash
 git clone https://github.com/rrburman23/CLEAR.git
 cd CLEAR
 ```
 
-**2. Create a virtual environment**
+#### 2. Create a virtual environment
 
 ```bash
 # Windows
@@ -206,13 +207,13 @@ python -m venv .venv
 source .venv/bin/activate
 ```
 
-**3. Install CLEAR**
+#### 3. Install CLEAR
 
 ```bash
 pip install -e .
 ```
 
-**4. Pull a local model**
+#### 4. Pull a local model
 
 ```bash
 ollama pull codegemma:7b
@@ -256,6 +257,29 @@ python -m run_benchmarks --types logic security oop python
 python -m run_benchmarks --no-graphs
 ```
 
+### Repeated Experiments (Windows)
+
+For repeated experiments (e.g. measuring run-to-run TTR variance under identical configurations), the `run_benchmarks.bat` wrapper executes the evaluation pipeline multiple times in sequence, with a cooldown between runs. It accepts the same arguments as `run_benchmarks` and passes them straight through:
+
+```bat
+:: Run the full suite 3 times (default)
+run_benchmarks.bat
+
+:: Repeat a specific model / category configuration
+run_benchmarks.bat --models qwen2.5-coder:7b --types logic
+```
+
+The number of repetitions is set by the `RUNS` variable at the top of the script (default: 3). Combined console output is appended to `batch_master.log` with per-run separators, and each repetition produces its own timestamped directory under `tests/results/`.
+
+### Help
+
+Both entry points are standard `argparse` CLIs — pass `-h` or `--help` to list all available options:
+
+```bash
+python -m src.main --help
+python -m run_benchmarks --help
+```
+
 ---
 
 ## Experiment Outputs
@@ -266,7 +290,7 @@ Each evaluation produces two kinds of output: human-readable execution logs and 
 
 Every run writes a descriptive log file to `tests/logs/`, named with the timestamp, models, and categories evaluated:
 
-```
+```text
 tests/logs/
 └── benchmark_20260709_220104_qwen2.5-coder-7b_logic_automated_repair.log
 ```
@@ -275,8 +299,8 @@ tests/logs/
 
 Every run creates a timestamped results directory containing granular repair metrics for downstream academic analysis:
 
-```
-tests/logs/
+```text
+tests/results/
 └── 20260709_220104/
     ├── results.csv
     ├── results.json
@@ -324,51 +348,47 @@ Each experiment automatically produces (requires `matplotlib`):
 
 ## Evaluation Metrics
 
-CLEAR evaluates models using five primary metrics.
+CLEAR evaluates models using six primary metrics.
 
 ### 1. Success Rate (SR)
 
 Percentage of benchmarks successfully repaired. Higher is better.
 
-$$
-SR = \frac{N_{successful}}{N_{total}} \times 100
-$$
+$$ SR = \frac{N_{successful}}{N_{total}} \times 100 $$
 
-### 2. Time To Resolution (TTR)
+### 2. Pass@1 (First-Iteration Success Rate)
+
+Percentage of benchmarks the model repaired on its very first attempt ($k=1$). This separates "zero-shot" code generation capability from "multi-turn" ReAct reasoning.
+
+$$ Pass@1 = \frac{N_{successful\_at\_1}}{N_{total}} \times 100 $$
+
+### 3. Time To Resolution (TTR)
 
 Mean time in seconds required to produce a verified repair. Lower is better.
 
-$$
-TTR = \frac{\sum T_i}{N_{successful}}
-$$
+$$ TTR = \frac{\sum T_i}{N_{successful}} $$
 
 where $T_i$ is the repair execution time for benchmark $i$.
 
-### 3. Iteration Efficiency (IE)
+### 4. Iteration Efficiency (IE)
 
 How efficiently the agent repairs programs. Higher values indicate fewer required repair attempts.
 
-$$
-IE = \frac{1}{N_{successful}} \sum_{i=1}^{N_{successful}} \frac{1}{k_i}
-$$
+$$ IE = \frac{1}{N_{successful}} \sum_{i=1}^{N_{successful}} \frac{1}{k_i} $$
 
 where $k_i$ is the number of repair iterations for benchmark $i$.
 
-### 4. Average Repair Iterations (ARI)
+### 5. Average Repair Iterations (ARI)
 
 Mean number of repair cycles across successful repairs. Lower values indicate more direct repairs.
 
-$$
-ARI = \frac{\sum k_i}{N_{successful}}
-$$
+$$ ARI = \frac{\sum k_i}{N_{successful}} $$
 
-### 5. Failure Rate (FR)
+### 6. Failure Rate (FR)
 
 Percentage of unsuccessful repairs. Lower is better.
 
-$$
-FR = \frac{N_{failed}}{N_{total}} \times 100
-$$
+$$ FR = \frac{N_{failed}}{N_{total}} \times 100 $$
 
 ---
 
