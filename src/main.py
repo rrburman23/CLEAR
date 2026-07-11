@@ -12,12 +12,15 @@ passed the sandbox validation suite.
 from __future__ import annotations
 
 import argparse
+
 import json
 import logging
 import os
 import sys
 import time
+
 from typing import Any, Sequence, cast
+from pathlib import Path
 
 from langchain_core.messages import (
     AIMessage,
@@ -28,7 +31,9 @@ from langchain_core.messages import (
 from langchain_core.runnables import RunnableConfig
 from langgraph.errors import GraphRecursionError
 
-from src.agent.logic import AgentState, clear_agent
+from src.agent.candidate import hash_candidate
+from src.agent.logic import clear_agent
+from src.agent.state import AgentState
 from src.utils.diff import generate_patch
 from src.utils.terminal import failure, info, success, warning
 
@@ -39,6 +44,12 @@ from src.utils.terminal import failure, info, success, warning
 
 DEFAULT_RECURSION_LIMIT = 31
 MESSAGE_PREVIEW_LIMIT = 150
+
+DIFFICULTY_DIRECTORIES = {
+    "single_fault",
+    "compound_same_category",
+    "compound_cross_category",
+}
 
 
 # =========================================================
@@ -119,29 +130,42 @@ def print_result(
 # Benchmark Identification
 # =========================================================
 
-
 def get_benchmark_name(path: str) -> str:
     """
-    Extract a category:benchmark identifier from a benchmark path.
+    Build a benchmark identifier from legacy or tiered benchmark paths.
 
-    Example:
+    Tiered:
+        tests/benchmarks/single_fault/concurrency/thread_lock/target.py
+        -> single_fault:concurrency:thread_lock
+
+    Legacy:
         tests/benchmarks/logic/factorial/target.py
-
-    becomes:
-        logic:factorial
+        -> logic:factorial
     """
-    path_parts = os.path.normpath(path).split(os.sep)
+
+    parts = Path(path).resolve().parts
 
     try:
-        benchmark_index = path_parts.index("benchmarks")
-        category = path_parts[benchmark_index + 1]
-        benchmark = path_parts[benchmark_index + 2]
+        benchmark_index = parts.index("benchmarks")
+    except ValueError:
+        return "unknown"
+
+    relative_parts = parts[benchmark_index + 1 : -1]
+
+    if len(relative_parts) >= 3 and relative_parts[0] in DIFFICULTY_DIRECTORIES:
+        difficulty = relative_parts[0]
+        category = relative_parts[1]
+        benchmark = relative_parts[2]
+
+        return f"{difficulty}:{category}:{benchmark}"
+
+    if len(relative_parts) >= 2:
+        category = relative_parts[0]
+        benchmark = relative_parts[1]
+
         return f"{category}:{benchmark}"
 
-    except (ValueError, IndexError):
-        parent_directory = os.path.basename(os.path.dirname(path))
-        filename = os.path.basename(path)
-        return f"{parent_directory}:{filename}"
+    return "unknown"
 
 
 # =========================================================
@@ -386,6 +410,7 @@ def make_content_preview(content: Any, limit: int = MESSAGE_PREVIEW_LIMIT) -> st
 
 def display_stream_message(message: BaseMessage) -> None:
     """Display one LangGraph message in the terminal."""
+
     preview = make_content_preview(message.content)
 
     if isinstance(message, HumanMessage):
@@ -393,14 +418,34 @@ def display_stream_message(message: BaseMessage) -> None:
             print("Human: (Repair specification and source injected)")
         else:
             print(f"Human: {preview}")
+
         return
 
     if isinstance(message, AIMessage):
         print(f"AI: {preview}")
 
         tool_calls = getattr(message, "tool_calls", None) or []
+
         for tool_call in tool_calls:
-            print("   Tool Requested: " f"{tool_call.get('name', 'unknown')}")
+            tool_name = tool_call.get("name", "unknown")
+            tool_arguments = tool_call.get("args", {})
+
+            print(f"   Tool Requested: {tool_name}")
+
+            if not isinstance(tool_arguments, dict):
+                continue
+
+            candidate_code = tool_arguments.get("code")
+
+            if isinstance(candidate_code, str) and candidate_code.strip():
+                candidate_hash = hash_candidate(
+                candidate_code
+                )
+
+                print(
+                    f"   Candidate: {candidate_hash} ({len(candidate_code)} characters)"
+                )
+
         return
 
     if isinstance(message, ToolMessage):
@@ -409,6 +454,7 @@ def display_stream_message(message: BaseMessage) -> None:
         if payload:
             tool_status = payload.get("status", "UNKNOWN")
             tool_message = payload.get("message", "")
+
             print(f"Tool: {tool_status} | {tool_message}")
         else:
             print(f"Tool: {preview}")
@@ -576,9 +622,9 @@ def main() -> None:
         "test_suite": test_suite,
         "invalid_responses": 0,
         "terminal_failure": None,
-        "last_candidate": None,
-        "duplicate_candidates": 0,
-    } # type: ignore
+        "last_candidate_hash": None,
+        "repeated_candidate_count": 0,
+    }
 
     graph_config: RunnableConfig = {
         "recursion_limit": arguments.recursion_limit,
@@ -586,7 +632,7 @@ def main() -> None:
 
     final_state: AgentState | None = None
     recursion_error = False
-    system_exception: Exception | None = None
+    system_exception: BaseException | None = None
 
     print("[WAIT] Agent deployed. Executing repair graph...\n")
     start_time = time.perf_counter()
@@ -622,7 +668,7 @@ def main() -> None:
 
     except KeyboardInterrupt:
         warning("Repair execution interrupted by the user.")
-        system_exception = KeyboardInterrupt() # type: ignore
+        system_exception = KeyboardInterrupt() 
 
     except Exception as exc:
         system_exception = exc

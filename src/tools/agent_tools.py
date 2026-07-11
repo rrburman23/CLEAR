@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import hashlib
 from typing import Any
 
 from langchain_core.tools import tool
@@ -37,6 +38,8 @@ tool_sandbox = SandboxManager()
 # Ensure the optional workspace exists.
 os.makedirs(WORKSPACE_DIR, exist_ok=True)
 
+# The maximum number of characters that can be returned in the "message" field of the JSON result.
+MAX_FEEDBACK_CHARACTERS = 6_000
 
 # =========================================================
 # Security Helpers
@@ -162,6 +165,26 @@ def write_file(filename: str, content: str) -> str:
         return f"ERROR: {exc}"
 
 
+def _truncate_feedback(
+    value: str | None,
+    limit: int = MAX_FEEDBACK_CHARACTERS,
+) -> str:
+    """
+    Preserve the most recent and normally most relevant part of sandbox
+    feedback while preventing oversized model prompts.
+    """
+
+    if not value:
+        return ""
+
+    value = str(value).strip()
+
+    if len(value) <= limit:
+        return value
+
+    return "[Earlier sandbox output truncated]\n" + value[-limit:]
+
+
 # =========================================================
 # Repair Verification Tool
 # =========================================================
@@ -224,9 +247,9 @@ def run_repair_attempt(
             test_suite=test_suite,
         )
 
-        output_text = _normalise_text(getattr(result, "output", ""))
+        output_text = _truncate_feedback(_normalise_text(getattr(result, "output", "")))
 
-        error_text = _normalise_text(getattr(result, "error", ""))
+        error_text = _truncate_feedback(_normalise_text(getattr(result, "error", "")))
 
         if bool(getattr(result, "success", False)):
             success("Sandbox verification passed.")

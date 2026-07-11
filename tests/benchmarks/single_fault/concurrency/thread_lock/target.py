@@ -1,29 +1,26 @@
 import threading
-import time
 
 
 class ResourceManager:
     """
-    Manages two independent resources.
-
+    Manages two shared resources using a consistent lock order.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.lock_a = threading.Lock()
         self.lock_b = threading.Lock()
+
         self.a_data = 0
         self.b_data = 0
 
-    def lock_a_then_b(self):
+    def update_from_a(self) -> None:
         with self.lock_a:
-            time.sleep(0.1)  # Force thread context switch
             with self.lock_b:
                 self.a_data += 1
                 self.b_data += 1
 
-    def lock_b_then_a(self):
-        with self.lock_b:
-            time.sleep(0.1)
-            with self.lock_a:
+    def update_from_b(self) -> None:
+        with self.lock_a:
+            with self.lock_b:
                 self.b_data += 1
                 self.a_data += 1

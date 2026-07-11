@@ -217,24 +217,58 @@ CLEAR/
 │   ├── failure_taxonomy.md
 │   ├── reproducibility.md
 │   └── contributing.md
+│
 ├── src/
 │   ├── agent/
-│   │   └── logic.py
+│   │   ├── __init__.py
+│   │   ├── candidate.py
+│   │   ├── logic.py
+│   │   ├── model_adapter.py
+│   │   ├── prompts.py
+│   │   ├── routing.py
+│   │   └── state.py
+│   │
+│   ├── benchmarking/
+│   │   ├── __init__.py
+│   │   ├── cli.py
+│   │   ├── constants.py
+│   │   ├── difficulty.py
+│   │   ├── discovery.py
+│   │   ├── execution.py
+│   │   ├── failures.py
+│   │   ├── metrics.py
+│   │   ├── models.py
+│   │   └── runner.py
+│   │
 │   ├── core/
 │   │   └── sandbox.py
+│   │
+│   ├── reporting/
+│   │   ├── __init__.py
+│   │   ├── exporter.py
+│   │   ├── graphs.py
+│   │   ├── markdown.py
+│   │   └── tables.py
+│   │
 │   ├── tools/
 │   │   └── agent_tools.py
+│   │
 │   ├── utils/
 │   │   ├── config.py
 │   │   ├── diff.py
 │   │   ├── parsers.py
-│   │   ├── result_export.py
 │   │   └── terminal.py
+│   │
 │   └── main.py
+│
 ├── tests/
 │   ├── benchmarks/
+│   │   ├── single_fault/
+│   │   ├── compound_same_category/
+│   │   └── compound_cross_category/
 │   ├── logs/
 │   └── validate_benchmarks.py
+│
 ├── run_benchmarks.py
 ├── run_benchmarks.bat
 ├── Dockerfile

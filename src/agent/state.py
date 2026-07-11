@@ -1,41 +1,57 @@
-# src/agent/state.py
 """
-CLEAR Agent State Definitions
+CLEAR Agent State
 
-This module centralizes the LangGraph state schema, decoupling state management
-from execution logic to prevent circular dependencies across the agent architecture.
+Defines the state shared by all nodes in the autonomous repair graph.
 """
 
 from __future__ import annotations
 
 from typing import Annotated, Sequence
-from typing_extensions import NotRequired, TypedDict
 
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
+from typing_extensions import NotRequired, TypedDict
 
 
 class AgentState(TypedDict):
     """
-    The immutable and mutable state payload passed between all LangGraph nodes.
+    State for one autonomous repair execution.
 
-    Attributes
-    ----------
-    messages : Sequence[BaseMessage]
-        The authoritative conversational history. Uses `add_messages` as a reducer
-        to continuously append new interactions (Agent/Sandbox) without overwriting.
-    test_suite : str
-        The canonical, human-authored validation oracle. Maintained out-of-band
-        from the LLM's context to prevent destructive hallucinations or test weakening.
-    invalid_responses : int, optional
-        Tracking counter for models that repeatedly fail to emit parseable JSON
-        or valid Markdown, preventing infinite fallback loops.
-    terminal_failure : str | None, optional
-        A structured string documenting catastrophic orchestration collapse or
-        unrecoverable protocol violations, signaling immediate graph termination.
+    Attributes:
+        messages:
+            LangChain conversation history. LangGraph appends new messages
+            using the add_messages reducer.
+
+        test_suite:
+            Canonical test suite supplied by src.main. The model is never
+            trusted to reproduce or modify this value.
+
+        invalid_responses:
+            Number of consecutive responses that could not be converted into
+            an executable repair candidate.
+
+        last_candidate_hash:
+            Stable hash of the most recently generated candidate.
+
+        repeated_candidate_count:
+            Number of consecutive times the current candidate has appeared.
+
+        terminal_failure:
+            Framework-generated terminal failure reason. When populated, the
+            routing layer ends the graph without another sandbox execution.
     """
 
-    messages: Annotated[Sequence[BaseMessage], add_messages]
+    messages: Annotated[
+        Sequence[BaseMessage],
+        add_messages,
+    ]
+
     test_suite: str
+
     invalid_responses: NotRequired[int]
+
+    last_candidate_hash: NotRequired[str | None]
+
+    repeated_candidate_count: NotRequired[int]
+
     terminal_failure: NotRequired[str | None]
