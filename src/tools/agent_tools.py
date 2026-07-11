@@ -1,169 +1,270 @@
 """
 CLEAR Agent Tools
 
-LangGraph tools exposed to the repair agent.
+Defines the tools available to the autonomous repair agent.
 
-Available tools:
-- read_file()
-- write_file()
-- run_repair_attempt()
+The most important tool is run_repair_attempt(), which:
 
-The LLM cannot execute code directly.
-All execution is delegated to SandboxManager.
+1. Receives a candidate repaired implementation.
+2. Executes it against the original test suite in Docker.
+3. Returns a structured JSON result.
+4. Includes the exact candidate code when verification succeeds.
+
+The LLM never executes generated code directly on the host.
 """
+
+from __future__ import annotations
+
+import json
+import os
+from typing import Any
 
 from langchain_core.tools import tool
 
-import os
-
 from src.core.sandbox import SandboxManager
-from src.utils.terminal import success, failure
 from src.utils.config import WORKSPACE_DIR
+from src.utils.terminal import failure, success
 
 
-# ---------------------------------------------------------------------
-# Sandbox instance
-# ---------------------------------------------------------------------
+# =========================================================
+# Sandbox Configuration
+# =========================================================
 
+# One SandboxManager is reused by the process.
+# Each individual execution still uses an ephemeral container.
 tool_sandbox = SandboxManager()
 
-# ---------------------------------------------------------------------
-# Workspace configuration
-# ---------------------------------------------------------------------
-
+# Ensure the optional workspace exists.
 os.makedirs(WORKSPACE_DIR, exist_ok=True)
 
-# ---------------------------------------------------------------------
-# Security helper
-# ---------------------------------------------------------------------
+
+# =========================================================
+# Security Helpers
+# =========================================================
 
 
 def _is_safe_path(filename: str) -> str:
     """
-    Ensures file access stays inside workspace.
+    Resolve a workspace file while preventing path traversal.
 
-    Prevents:
+    A path such as:
+
         ../../secret.txt
 
-    from escaping the workspace directory.
+    must never be allowed to escape WORKSPACE_DIR.
     """
 
-    requested_path = os.path.abspath(os.path.join(WORKSPACE_DIR, filename))
+    workspace = os.path.realpath(WORKSPACE_DIR)
+    requested_path = os.path.realpath(os.path.join(workspace, filename))
 
-    workspace = os.path.abspath(WORKSPACE_DIR)
+    try:
+        common_path = os.path.commonpath([workspace, requested_path])
+    except ValueError as exc:
+        # Can occur on Windows when paths refer to different drives.
+        raise ValueError(f"Security violation: invalid path '{filename}'.") from exc
 
-    # Safer than startswith()
-    if os.path.commonpath([requested_path, workspace]) != workspace:
-        raise ValueError(f"Security Violation: Access denied to {filename}")
+    if common_path != workspace:
+        raise ValueError(f"Security violation: access denied to '{filename}'.")
 
     return requested_path
 
 
-# ---------------------------------------------------------------------
-# File reading tool
-# ---------------------------------------------------------------------
+def _normalise_text(value: Any) -> str:
+    """
+    Convert a value into a string suitable for JSON output.
+    """
+
+    if value is None:
+        return ""
+
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+
+    return str(value)
+
+
+def _json_result(
+    *,
+    status: str,
+    code: str,
+    output: str = "",
+    error: str = "",
+    message: str = "",
+) -> str:
+    """
+    Build the structured result consumed by LangGraph and src.main.
+
+    The successful candidate code is returned with the verification
+    result so that the framework can write exactly the code that passed.
+    """
+
+    payload = {
+        "status": status,
+        "code": code,
+        "output": output,
+        "error": error,
+        "message": message,
+    }
+
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+    )
+
+
+# =========================================================
+# Optional Workspace Tools
+# =========================================================
 
 
 @tool
 def read_file(filename: str) -> str:
     """
-    Reads a Python file from the CLEAR workspace.
+    Read a text file from the restricted CLEAR workspace.
+
+    This tool is not exposed to the repair graph by default, but remains
+    available for future workspace-based workflows.
     """
 
     try:
         filepath = _is_safe_path(filename)
 
-        if not os.path.exists(filepath):
-            return f"Error: File '{filename}' not found."
+        if not os.path.isfile(filepath):
+            return f"ERROR: File '{filename}' was not found."
 
-        with open(filepath, "r", encoding="utf-8") as f:
-            return f.read()
+        with open(filepath, "r", encoding="utf-8") as file_handle:
+            return file_handle.read()
 
-    except Exception as e:
-        return f"Error: {str(e)}"
-
-
-# ---------------------------------------------------------------------
-# File writing tool
-# ---------------------------------------------------------------------
+    except Exception as exc:
+        return f"ERROR: {exc}"
 
 
 @tool
 def write_file(filename: str, content: str) -> str:
     """
-    Writes repaired code into workspace.
+    Write text to a file inside the restricted CLEAR workspace.
+
+    Parent directories are created when necessary.
     """
 
     try:
         filepath = _is_safe_path(filename)
 
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(content)
+        parent_directory = os.path.dirname(filepath)
+        os.makedirs(parent_directory, exist_ok=True)
 
-        return f"Success: Updated '{filename}'."
+        with open(filepath, "w", encoding="utf-8") as file_handle:
+            file_handle.write(content)
 
-    except Exception as e:
-        return f"Error: {str(e)}"
+        return f"SUCCESS: Updated '{filename}'."
+
+    except Exception as exc:
+        return f"ERROR: {exc}"
 
 
-# ---------------------------------------------------------------------
-# Repair execution tool
-# ---------------------------------------------------------------------
+# =========================================================
+# Repair Verification Tool
+# =========================================================
 
 
 @tool
-def run_repair_attempt(code: str, test_suite: str) -> str:
+def run_repair_attempt(
+    code: str,
+    test_suite: str,
+) -> str:
     """
-    Executes a candidate repair.
+    Execute a candidate repair against the supplied test suite.
 
-    The generated code is executed ONLY inside
-    the Docker sandbox.
+    Parameters
+    ----------
+    code:
+        Complete candidate source for target.py.
 
-    Returns:
-        SUCCESS if tests pass.
-        FAILURE with traceback otherwise.
+    test_suite:
+        Original validation suite. The model must pass this through
+        unchanged.
+
+    Returns
+    -------
+    str
+        A JSON document containing:
+
+        - status: SUCCESS or FAILURE
+        - code: the attempted candidate
+        - output: captured successful output
+        - error: captured failure output
+        - message: short human-readable summary
+
+    Important
+    ---------
+    When status is SUCCESS, `code` is the exact implementation that
+    passed sandbox verification. src.main writes this code directly to
+    target.py, removing the need for an additional LLM response.
     """
-    #print("\n" + "=" * 60)
-    #print("CLEAR REPAIR ATTEMPT")
-    #print("=" * 60)
 
-    #print("\n--- GENERATED CODE ---")
-    #print(code)
+    if not isinstance(code, str) or not code.strip():
+        return _json_result(
+            status="FAILURE",
+            code="",
+            error="Candidate code was empty.",
+            message="Invalid repair payload.",
+        )
 
-    #print("\n--- TEST SUITE ---")
-    #print(test_suite)
+    if not isinstance(test_suite, str) or not test_suite.strip():
+        return _json_result(
+            status="FAILURE",
+            code=code,
+            error="The validation test suite was empty.",
+            message="Invalid test payload.",
+        )
 
-    #print("=" * 60)
-    
     try:
         result = tool_sandbox.execute(
             code=code,
             test_suite=test_suite,
         )
-        
-        print("\n--- SANDBOX RESULT ---")
-        print(result.success)
 
-        print(result.output)
-        print(result.error)
-        
-        if result.success:
+        output_text = _normalise_text(getattr(result, "output", ""))
 
-            success(
-                "Sandbox verification passed."
+        error_text = _normalise_text(getattr(result, "error", ""))
+
+        if bool(getattr(result, "success", False)):
+            success("Sandbox verification passed.")
+
+            return _json_result(
+                status="SUCCESS",
+                code=code,
+                output=output_text,
+                error="",
+                message="All supplied tests passed.",
             )
 
-            return "SUCCESS: All tests pass."
+        failure("Sandbox verification failed.")
 
-
-        failure(
-            "Sandbox verification failed."
+        return _json_result(
+            status="FAILURE",
+            code=code,
+            output=output_text,
+            error=error_text,
+            message="The candidate did not pass the supplied tests.",
         )
 
-        return (
-            "FAILURE\n"
-            f"{result.error}"
+    except TimeoutError as exc:
+        failure("Sandbox execution timed out.")
+
+        return _json_result(
+            status="FAILURE",
+            code=code,
+            error=f"TimeoutError: {exc}",
+            message="Sandbox execution timeout.",
         )
 
-    except Exception as e:
-        return f"FAILURE\nSandbox execution error: {str(e)}"
+    except Exception as exc:
+        failure("Sandbox execution raised an exception.")
+
+        return _json_result(
+            status="FAILURE",
+            code=code,
+            error=f"{type(exc).__name__}: {exc}",
+            message="Sandbox infrastructure failure.",
+        )

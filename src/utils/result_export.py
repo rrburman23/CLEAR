@@ -1,264 +1,1194 @@
 """
-CLEAR Telemetry Exporter
-Handles the serialization of benchmark execution data into machine-readable
-flat files (CSV, JSON) for downstream academic analysis.
+CLEAR Result Export Utilities
 
-Generates advanced statistical visualizations (Heatmaps, CDFs, Stacked Bars)
-to empirically evaluate SLM cognitive boundaries.
+Exports one benchmark experiment to:
+
+    run_directory/
+    ├── dataset.csv
+    ├── dataset.json
+    ├── summary_by_model.csv
+    ├── summary_by_difficulty.csv
+    ├── summary_by_model_difficulty.csv
+    ├── failure_summary.csv
+    ├── analysis_report.md
+    └── graphs/
+        ├── fig_01_success_rate_by_model.png
+        ├── fig_02_mean_ttr_by_model.png
+        ├── fig_03_success_rate_by_difficulty.png
+        ├── fig_04_model_difficulty_heatmap.png
+        ├── fig_05_ttr_by_difficulty.png
+        ├── fig_06_iterations_by_difficulty.png
+        ├── fig_07_failures_by_difficulty.png
+        └── fig_08_success_rate_by_category.png
 """
+
+from __future__ import annotations
 
 import csv
 import json
+import logging
+import math
 import os
-from typing import List, Dict, Any
+from collections import defaultdict
+from datetime import datetime
+from typing import Any
 
-from src.utils.terminal import success, warning, info
+from src.utils.terminal import success, warning
 
 
-def export_results(raw_data: List[Dict[str, Any]], run_dir: str) -> None:
+DIFFICULTY_ORDER = [
+    "single_fault",
+    "compound_same_category",
+    "compound_cross_category",
+]
+
+DIFFICULTY_LABELS = {
+    "single_fault": "T1: Single-Fault",
+    "compound_same_category": ("T2: Homogeneous Compound"),
+    "compound_cross_category": ("T3: Heterogeneous Compound"),
+}
+
+DATASET_FIELDS = [
+    "model",
+    "difficulty",
+    "difficulty_tier",
+    "difficulty_code",
+    "difficulty_label",
+    "difficulty_definition",
+    "category",
+    "benchmark",
+    "benchmark_id",
+    "passed",
+    "verified",
+    "ttr",
+    "wall_time",
+    "iterations",
+    "failure_reason",
+    "return_code",
+    "timed_out",
+]
+
+
+# =========================================================
+# Data Normalisation
+# =========================================================
+
+
+def normalise_record(
+    record: dict[str, Any],
+) -> dict[str, Any]:
     """
-    Exports raw execution telemetry to CSV and JSON formats inside the run directory.
-    Calculates advanced academic metrics (Pass@1, Category SR) for the JSON payload.
+    Return a record containing every standard dataset field.
     """
-    if not raw_data:
-        warning("No raw data collected to export.")
-        return
 
-    csv_path = os.path.join(run_dir, "dataset.csv")
-    json_path = os.path.join(run_dir, "dataset.json")
+    return {field: record.get(field) for field in DATASET_FIELDS}
 
-    # =========================================================
-    # Calculate Advanced Metrics for JSON payload
-    # =========================================================
-    advanced_metrics = {"aggregate_stats": {}, "raw_execution_data": raw_data}
 
-    # Group data by model
-    models = {row["model"] for row in raw_data}
+def safe_mean(
+    values: list[float],
+) -> float | None:
+    """
+    Return a mean or None for an empty collection.
+    """
 
-    for model in models:
-        model_runs = [r for r in raw_data if r["model"] == model]
-        total_runs = len(model_runs)
-        success_runs = [r for r in model_runs if r["passed"]]
+    if not values:
+        return None
 
-        # Calculate Pass@1 (First-iteration success)
-        pass_at_1 = len([r for r in success_runs if r["iterations"] == 1])
+    return sum(values) / len(values)
 
-        # Category Breakdown
-        categories = {r["category"] for r in model_runs}
-        cat_stats = {}
-        for cat in categories:
-            cat_runs = [r for r in model_runs if r["category"] == cat]
-            cat_success = len([r for r in cat_runs if r["passed"]])
-            cat_stats[cat] = (cat_success / len(cat_runs)) * 100 if cat_runs else 0
 
-        advanced_metrics["aggregate_stats"][model] = {
-            "success_rate_total": (len(success_runs) / total_runs) * 100
-            if total_runs
-            else 0,
-            "pass_at_1_rate": (pass_at_1 / total_runs) * 100 if total_runs else 0,
-            "category_success_rates": cat_stats,
+# =========================================================
+# Summary Calculation
+# =========================================================
+
+
+def summarise_records(
+    records: list[dict[str, Any]],
+    group_fields: list[str],
+) -> list[dict[str, Any]]:
+    """
+    Calculate CLEAR metrics grouped by the supplied fields.
+
+    TTR, IE and ARI use verified successful repairs only.
+    SR, Pass@1 and FR use every attempted benchmark.
+    """
+
+    groups: dict[
+        tuple[Any, ...],
+        list[dict[str, Any]],
+    ] = defaultdict(list)
+
+    for record in records:
+        key = tuple(record.get(field) for field in group_fields)
+
+        groups[key].append(record)
+
+    summaries: list[dict[str, Any]] = []
+
+    for key, group in groups.items():
+        total = len(group)
+
+        successful = [record for record in group if record.get("passed") is True]
+
+        failed = total - len(successful)
+
+        first_attempt_successes = sum(
+            1 for record in successful if record.get("iterations") == 1
+        )
+
+        successful_ttr = [
+            float(record["ttr"])
+            for record in successful
+            if record.get("ttr") is not None
+        ]
+
+        successful_wall_time = [
+            float(record["wall_time"])
+            for record in successful
+            if record.get("wall_time") is not None
+        ]
+
+        successful_iterations = [
+            int(record["iterations"])
+            for record in successful
+            if (
+                isinstance(
+                    record.get("iterations"),
+                    (int, float),
+                )
+                and record["iterations"] > 0
+            )
+        ]
+
+        inverse_iterations = [1 / iterations for iterations in successful_iterations]
+
+        row = {
+            field: value
+            for field, value in zip(
+                group_fields,
+                key,
+                strict=True,
+            )
         }
 
-    # =========================================================
-    # Export to Disk
-    # =========================================================
-    try:
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(advanced_metrics, f, indent=4)
-        success("JSON advanced dataset exported to run directory.")
-    except Exception as e:
-        warning(f"Failed to export JSON: {e}")
+        row.update(
+            {
+                "attempts": total,
+                "successes": len(successful),
+                "failures": failed,
+                "success_rate_pct": (100 * len(successful) / total if total else 0.0),
+                "pass_at_1_pct": (
+                    100 * first_attempt_successes / total if total else 0.0
+                ),
+                "mean_ttr_s": safe_mean(successful_ttr),
+                "mean_wall_time_s": safe_mean(successful_wall_time),
+                "iteration_efficiency": (safe_mean(inverse_iterations)),
+                "average_repair_iterations": (
+                    safe_mean([float(value) for value in successful_iterations])
+                ),
+                "failure_rate_pct": (100 * failed / total if total else 0.0),
+            }
+        )
 
-    headers = list(raw_data[0].keys())
-    try:
-        with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=headers)
-            writer.writeheader()
-            writer.writerows(raw_data)
-        success("CSV raw dataset exported to run directory.")
+        summaries.append(row)
 
-        # Create a dedicated graphs subfolder and generate plots
-        graphs_dir = os.path.join(run_dir, "graphs")
-        os.makedirs(graphs_dir, exist_ok=True)
-        _generate_visualizations(csv_path, graphs_dir)
-
-    except Exception as e:
-        warning(f"Failed to export CSV: {e}")
+    return summaries
 
 
-def _generate_visualizations(csv_path: str, graphs_dir: str) -> None:
+def build_failure_summary(
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     """
-    Generates academic figures for the dissertation Evaluation chapter.
-    Requires pandas, matplotlib, and seaborn.
+    Count failures by model, difficulty and reason.
     """
+
+    counts: dict[
+        tuple[str, str, str],
+        int,
+    ] = defaultdict(int)
+
+    for record in records:
+        if record.get("passed") is True:
+            continue
+
+        model = str(record.get("model") or "unknown")
+
+        difficulty = str(record.get("difficulty") or "unknown")
+
+        reason = str(record.get("failure_reason") or "Unknown repair failure")
+
+        counts[
+            (
+                model,
+                difficulty,
+                reason,
+            )
+        ] += 1
+
+    rows = [
+        {
+            "model": model,
+            "difficulty": difficulty,
+            "difficulty_display": (
+                DIFFICULTY_LABELS.get(
+                    difficulty,
+                    difficulty,
+                )
+            ),
+            "failure_reason": reason,
+            "count": count,
+        }
+        for (
+            model,
+            difficulty,
+            reason,
+        ), count in counts.items()
+    ]
+
+    rows.sort(
+        key=lambda row: (
+            row["model"],
+            DIFFICULTY_ORDER.index(row["difficulty"])
+            if row["difficulty"] in DIFFICULTY_ORDER
+            else 999,
+            -row["count"],
+            row["failure_reason"],
+        )
+    )
+
+    return rows
+
+
+# =========================================================
+# File Writers
+# =========================================================
+
+
+def write_csv(
+    path: str,
+    rows: list[dict[str, Any]],
+    fieldnames: list[str] | None = None,
+) -> None:
+    """
+    Write dictionaries to a UTF-8 CSV file.
+    """
+
+    if fieldnames is None:
+        fieldnames = list(rows[0]) if rows else []
+
+    with open(
+        path,
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as file_handle:
+        if not fieldnames:
+            return
+
+        writer = csv.DictWriter(
+            file_handle,
+            fieldnames=fieldnames,
+            extrasaction="ignore",
+        )
+
+        writer.writeheader()
+
+        writer.writerows(rows)
+
+
+def format_number(
+    value: Any,
+    decimal_places: int = 2,
+) -> str:
+    """
+    Format optional numerical values for Markdown.
+    """
+
+    if value is None:
+        return "N/A"
+
+    if isinstance(value, float) and math.isnan(value):
+        return "N/A"
+
     try:
-        import pandas as pd
+        return f"{float(value):.{decimal_places}f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def markdown_table(
+    rows: list[dict[str, Any]],
+    columns: list[tuple[str, str]],
+) -> str:
+    """
+    Construct a Markdown table.
+    """
+
+    headings = [heading for _, heading in columns]
+
+    output = [
+        "| " + " | ".join(headings) + " |",
+        "| " + " | ".join("---" for _ in headings) + " |",
+    ]
+
+    for row in rows:
+        values = []
+
+        for field, _ in columns:
+            value = row.get(field)
+
+            if field.endswith("_pct"):
+                value = format_number(
+                    value,
+                    1,
+                )
+
+            elif field in {
+                "mean_ttr_s",
+                "mean_wall_time_s",
+                "average_repair_iterations",
+            }:
+                value = format_number(
+                    value,
+                    2,
+                )
+
+            elif field == "iteration_efficiency":
+                value = format_number(
+                    value,
+                    3,
+                )
+
+            elif value is None:
+                value = "N/A"
+
+            values.append(str(value))
+
+        output.append("| " + " | ".join(values) + " |")
+
+    return "\n".join(output)
+
+
+# =========================================================
+# Markdown Report
+# =========================================================
+
+
+def write_analysis_report(
+    *,
+    run_dir: str,
+    records: list[dict[str, Any]],
+    by_model: list[dict[str, Any]],
+    by_difficulty: list[dict[str, Any]],
+    by_model_difficulty: list[dict[str, Any]],
+    failure_summary: list[dict[str, Any]],
+) -> None:
+    """
+    Write a human-readable experiment report.
+    """
+
+    report_path = os.path.join(
+        run_dir,
+        "analysis_report.md",
+    )
+
+    model_columns = [
+        ("model", "Model"),
+        ("attempts", "N"),
+        ("success_rate_pct", "SR (%)"),
+        ("pass_at_1_pct", "Pass@1 (%)"),
+        ("mean_ttr_s", "TTR (s)"),
+        (
+            "iteration_efficiency",
+            "IE",
+        ),
+        (
+            "average_repair_iterations",
+            "ARI",
+        ),
+        ("failure_rate_pct", "FR (%)"),
+    ]
+
+    difficulty_columns = [
+        (
+            "difficulty_display",
+            "Difficulty",
+        ),
+        ("attempts", "N"),
+        ("success_rate_pct", "SR (%)"),
+        ("pass_at_1_pct", "Pass@1 (%)"),
+        ("mean_ttr_s", "TTR (s)"),
+        (
+            "average_repair_iterations",
+            "ARI",
+        ),
+        ("failure_rate_pct", "FR (%)"),
+    ]
+
+    model_difficulty_rows = []
+
+    for row in by_model_difficulty:
+        converted = dict(row)
+
+        converted["difficulty_display"] = DIFFICULTY_LABELS.get(
+            str(row.get("difficulty")),
+            str(row.get("difficulty")),
+        )
+
+        model_difficulty_rows.append(converted)
+
+    difficulty_rows = []
+
+    for row in by_difficulty:
+        converted = dict(row)
+
+        converted["difficulty_display"] = DIFFICULTY_LABELS.get(
+            str(row.get("difficulty")),
+            str(row.get("difficulty")),
+        )
+
+        difficulty_rows.append(converted)
+
+    failure_columns = [
+        ("model", "Model"),
+        (
+            "difficulty_display",
+            "Difficulty",
+        ),
+        (
+            "failure_reason",
+            "Failure reason",
+        ),
+        ("count", "Count"),
+    ]
+
+    content = f"""# CLEAR Benchmark Experiment Report
+
+Generated: {datetime.now().isoformat()}
+
+## Dataset
+
+- Repair attempts: {len(records)}
+- Models: {len({record.get("model") for record in records})}
+- Difficulty levels: {len({record.get("difficulty") for record in records})}
+- Categories: {len({record.get("category") for record in records})}
+- Benchmarks: {len({record.get("benchmark_id") for record in records})}
+
+## Overall Model Performance
+
+{markdown_table(by_model, model_columns)}
+
+## Performance by Difficulty
+
+{markdown_table(difficulty_rows, difficulty_columns)}
+
+## Model × Difficulty Performance
+
+{
+        markdown_table(
+            model_difficulty_rows,
+            [
+                ("model", "Model"),
+                ("difficulty_display", "Difficulty"),
+                ("attempts", "N"),
+                ("success_rate_pct", "SR (%)"),
+                ("pass_at_1_pct", "Pass@1 (%)"),
+                ("mean_ttr_s", "TTR (s)"),
+                ("average_repair_iterations", "ARI"),
+                ("failure_rate_pct", "FR (%)"),
+            ],
+        )
+    }
+
+## Failure Analysis
+
+{
+        markdown_table(
+            failure_summary,
+            failure_columns,
+        )
+        if failure_summary
+        else "No failures were recorded."
+    }
+
+## Difficulty Definitions
+
+| Tier | Folder | Dissertation label | Definition |
+|---|---|---|---|
+| Tier 1 | `single_fault` | Single-Fault Repair | One intentionally seeded defect |
+| Tier 2 | `compound_same_category` | Homogeneous Compound-Fault Repair | Multiple defects from one fault category |
+| Tier 3 | `compound_cross_category` | Heterogeneous Compound-Fault Repair | Multiple defects from different categories |
+"""
+
+    with open(
+        report_path,
+        "w",
+        encoding="utf-8",
+    ) as file_handle:
+        file_handle.write(content)
+
+
+# =========================================================
+# Graph Generation
+# =========================================================
+
+
+def generate_graphs(
+    records: list[dict[str, Any]],
+    run_dir: str,
+) -> None:
+    """
+    Generate academic experiment figures.
+
+    Graph generation is optional. CSV and JSON exports still succeed when
+    pandas or matplotlib are unavailable.
+    """
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+
         import matplotlib.pyplot as plt
-        import seaborn as sns
+        import numpy as np
+        import pandas as pd
 
-        info("Data science libraries detected. Generating academic figures...")
-        df = pd.read_csv(csv_path)
-        df["passed"] = df["passed"].astype(bool)
-
-        # Set academic styling
-        sns.set_theme(style="whitegrid", palette="muted")
-
-        # =========================================================
-        # Figure 1: Success Rate by Architecture (Bar Chart)
-        # =========================================================
-        plt.figure(figsize=(10, 6))
-        sr_data = (
-            df.groupby("model")["passed"].mean().sort_values(ascending=False) * 100
+    except ImportError as exc:
+        warning(
+            "Graph generation skipped because a data-science "
+            f"dependency is unavailable: {exc}"
         )
-        sns.barplot(
-            x=sr_data.values,
-            y=sr_data.index,
-            hue=sr_data.index,
-            legend=False,
-            palette="viridis",
+        return
+
+    if not records:
+        warning("Graph generation skipped because the dataset is empty.")
+        return
+
+    graph_dir = os.path.join(
+        run_dir,
+        "graphs",
+    )
+
+    os.makedirs(
+        graph_dir,
+        exist_ok=True,
+    )
+
+    frame = pd.DataFrame(records)
+
+    frame["passed"] = frame["passed"].astype(bool)
+
+    frame["difficulty_display"] = (
+        frame["difficulty"].map(DIFFICULTY_LABELS).fillna(frame["difficulty"])
+    )
+
+    difficulty_display_order = [
+        DIFFICULTY_LABELS[difficulty]
+        for difficulty in DIFFICULTY_ORDER
+        if difficulty in set(frame["difficulty"])
+    ]
+
+    # -----------------------------------------------------
+    # Figure 1: Success Rate by Model
+    # -----------------------------------------------------
+
+    model_success = (
+        frame.groupby("model")["passed"].mean().mul(100).sort_values(ascending=False)
+    )
+
+    figure, axis = plt.subplots(
+        figsize=(
+            max(9, len(model_success) * 1.1),
+            5,
         )
-        plt.title(
-            "Autonomous Repair Success Rate (%) by Architecture", fontsize=14, pad=15
+    )
+
+    model_success.plot(
+        kind="bar",
+        ax=axis,
+    )
+
+    axis.set_title("Verified Repair Success Rate by Model")
+
+    axis.set_xlabel("Model")
+
+    axis.set_ylabel("Success Rate (%)")
+
+    axis.set_ylim(
+        0,
+        105,
+    )
+
+    axis.tick_params(
+        axis="x",
+        rotation=35,
+    )
+
+    figure.tight_layout()
+
+    figure.savefig(
+        os.path.join(
+            graph_dir,
+            "fig_01_success_rate_by_model.png",
+        ),
+        dpi=300,
+        bbox_inches="tight",
+    )
+
+    plt.close(figure)
+
+    # -----------------------------------------------------
+    # Figure 2: Mean Successful TTR by Model
+    # -----------------------------------------------------
+
+    successful = frame[frame["passed"]].copy()
+
+    if not successful.empty:
+        model_ttr = successful.groupby("model")["ttr"].mean().sort_values()
+
+        figure, axis = plt.subplots(
+            figsize=(
+                max(9, len(model_ttr) * 1.1),
+                5,
+            )
         )
-        plt.xlabel("Success Rate (%)", fontsize=12)
-        plt.ylabel("Model", fontsize=12)
-        plt.xlim(0, 100)
-        plt.tight_layout()
-        plt.savefig(os.path.join(graphs_dir, "fig_1_success_rate.png"), dpi=300)
-        plt.close()
 
-        # =========================================================
-        # Figure 2: TTR Distribution (Box Plot)
-        # =========================================================
-        plt.figure(figsize=(10, 6))
-        success_df = df[df["passed"] == True]
-        if not success_df.empty:
-            sns.boxplot(
-                data=success_df,
-                x="ttr",
-                y="model",
-                hue="model",
-                legend=False,
-                palette="mako",
-            )
-            plt.title(
-                "Time To Resolution (TTR) Distribution (Successful Repairs)",
-                fontsize=14,
-                pad=15,
-            )
-            plt.xlabel("Seconds", fontsize=12)
-            plt.ylabel("Model", fontsize=12)
-            plt.tight_layout()
-            plt.savefig(os.path.join(graphs_dir, "fig_2_ttr_dist.png"), dpi=300)
-        plt.close()
-
-        # =========================================================
-        # Figure 3: Category Performance Heatmap
-        # =========================================================
-        plt.figure(figsize=(12, 7))
-        # Create a pivot table: Rows = Models, Columns = Categories, Values = % Passed
-        pivot_df = (
-            df.pivot_table(
-                values="passed", index="model", columns="category", aggfunc="mean"
-            )
-            * 100
+        model_ttr.plot(
+            kind="bar",
+            ax=axis,
         )
-        sns.heatmap(
-            pivot_df,
-            annot=True,
-            cmap="YlGnBu",
-            fmt=".0f",
-            cbar_kws={"label": "Success Rate (%)"},
+
+        axis.set_title("Mean Time to Resolution by Model")
+
+        axis.set_xlabel("Model")
+
+        axis.set_ylabel("Mean TTR (seconds)")
+
+        axis.tick_params(
+            axis="x",
+            rotation=35,
         )
-        plt.title("Fault Category Success Rate Heatmap", fontsize=14, pad=15)
-        plt.xlabel("Fault Category", fontsize=12)
-        plt.ylabel("Model Architecture", fontsize=12)
-        plt.xticks(rotation=45, ha="right")
-        plt.tight_layout()
-        plt.savefig(os.path.join(graphs_dir, "fig_3_category_heatmap.png"), dpi=300)
-        plt.close()
 
-        # =========================================================
-        # Figure 4: Failure Taxonomy Breakdown (Stacked Bar)
-        # =========================================================
-        fail_df = df[df["passed"] == False].copy()
-        if not fail_df.empty:
-            plt.figure(figsize=(12, 7))
-            # Clean up long failure strings for the legend
-            fail_df["failure_reason"] = fail_df["failure_reason"].apply(
-                lambda x: str(x).split("(")[0].strip()
-            )
+        figure.tight_layout()
 
-            # Count occurrences of each failure reason per model
-            fail_counts = (
-                fail_df.groupby(["model", "failure_reason"])
-                .size()
-                .unstack(fill_value=0)
-            )
-
-            # Normalize to 100%
-            fail_pct = fail_counts.div(fail_counts.sum(axis=1), axis=0) * 100
-
-            # Plot stacked bar chart
-            fail_pct.plot(kind="bar", stacked=True, colormap="Set2", figsize=(12, 7))
-            plt.title("Failure Taxonomy Breakdown (100% Stacked)", fontsize=14, pad=15)
-            plt.xlabel("Model", fontsize=12)
-            plt.ylabel("Percentage of Failures (%)", fontsize=12)
-            plt.legend(
-                title="Primary Cause of Failure",
-                bbox_to_anchor=(1.05, 1),
-                loc="upper left",
-            )
-            plt.xticks(rotation=45, ha="right")
-            plt.tight_layout()
-            plt.savefig(os.path.join(graphs_dir, "fig_4_failure_taxonomy.png"), dpi=300)
-            plt.close()
-
-        # =========================================================
-        # Figure 5: Cumulative Success over Iterations (CDF)
-        # =========================================================
-        plt.figure(figsize=(10, 6))
-        max_iterations = 15
-        iterations_range = range(1, max_iterations + 1)
-
-        for model in df["model"].unique():
-            model_df = df[df["model"] == model]
-            total_runs = len(model_df)
-            model_success_df = model_df[model_df["passed"] == True]
-
-            cumulative_success = []
-            for i in iterations_range:
-                # How many runs passed taking `i` or fewer iterations?
-                count = len(model_success_df[model_success_df["iterations"] <= i])
-                cumulative_success.append((count / total_runs) * 100)
-
-            plt.plot(
-                iterations_range,
-                cumulative_success,
-                marker="o",
-                linewidth=2,
-                label=model,
-            )
-
-        plt.title("Cumulative Repair Success by Iteration Count", fontsize=14, pad=15)
-        plt.xlabel("Iteration Limit (k)", fontsize=12)
-        plt.ylabel("Cumulative Success Rate (%)", fontsize=12)
-        plt.xlim(1, max_iterations)
-        plt.ylim(0, 105)
-        plt.grid(True, linestyle="--", alpha=0.7)
-        plt.legend(
-            title="Model Architecture", bbox_to_anchor=(1.05, 1), loc="upper left"
+        figure.savefig(
+            os.path.join(
+                graph_dir,
+                "fig_02_mean_ttr_by_model.png",
+            ),
+            dpi=300,
+            bbox_inches="tight",
         )
-        plt.tight_layout()
-        plt.savefig(os.path.join(graphs_dir, "fig_5_iteration_cdf.png"), dpi=300)
-        plt.close()
 
-        success(f"5 Academic Figures generated successfully in {graphs_dir}")
+        plt.close(figure)
 
-    except ImportError:
-        warning("Pandas/Matplotlib/Seaborn not found. Skipping graph generation.")
-        info(
-            "Run 'pip install pandas matplotlib seaborn' to enable automatic graphing."
+    # -----------------------------------------------------
+    # Figure 3: Success Rate by Difficulty
+    # -----------------------------------------------------
+
+    difficulty_success = (
+        frame.groupby("difficulty_display")["passed"]
+        .mean()
+        .mul(100)
+        .reindex(difficulty_display_order)
+        .dropna()
+    )
+
+    figure, axis = plt.subplots(figsize=(9, 5))
+
+    difficulty_success.plot(
+        kind="bar",
+        ax=axis,
+    )
+
+    axis.set_title("Verified Repair Success Rate by Difficulty")
+
+    axis.set_xlabel("Difficulty")
+
+    axis.set_ylabel("Success Rate (%)")
+
+    axis.set_ylim(
+        0,
+        105,
+    )
+
+    axis.tick_params(
+        axis="x",
+        rotation=20,
+    )
+
+    figure.tight_layout()
+
+    figure.savefig(
+        os.path.join(
+            graph_dir,
+            "fig_03_success_rate_by_difficulty.png",
+        ),
+        dpi=300,
+        bbox_inches="tight",
+    )
+
+    plt.close(figure)
+
+    # -----------------------------------------------------
+    # Figure 4: Model × Difficulty Heatmap
+    # -----------------------------------------------------
+
+    heatmap = frame.pivot_table(
+        index="model",
+        columns="difficulty_display",
+        values="passed",
+        aggfunc="mean",
+    ).mul(100)
+
+    available_columns = [
+        column for column in difficulty_display_order if column in heatmap.columns
+    ]
+
+    heatmap = heatmap.reindex(columns=available_columns)
+
+    figure, axis = plt.subplots(
+        figsize=(
+            max(8, len(heatmap.columns) * 2.6),
+            max(5, len(heatmap.index) * 0.65),
         )
-    except Exception as e:
-        warning(f"Graph generation failed: {e}")
+    )
+
+    image = axis.imshow(
+        heatmap.values,
+        aspect="auto",
+        vmin=0,
+        vmax=100,
+    )
+
+    axis.set_xticks(range(len(heatmap.columns)))
+
+    axis.set_xticklabels(
+        heatmap.columns,
+        rotation=25,
+        ha="right",
+    )
+
+    axis.set_yticks(range(len(heatmap.index)))
+
+    axis.set_yticklabels(heatmap.index)
+
+    for row_index in range(len(heatmap.index)):
+        for column_index in range(len(heatmap.columns)):
+            value = heatmap.iloc[
+                row_index,
+                column_index,
+            ]
+
+            if pd.notna(value):
+                axis.text(
+                    column_index,
+                    row_index,
+                    f"{value:.1f}%",
+                    ha="center",
+                    va="center",
+                )
+
+    figure.colorbar(
+        image,
+        ax=axis,
+        label="Success Rate (%)",
+    )
+
+    axis.set_title("Model × Difficulty Success Rate")
+
+    figure.tight_layout()
+
+    figure.savefig(
+        os.path.join(
+            graph_dir,
+            "fig_04_model_difficulty_heatmap.png",
+        ),
+        dpi=300,
+        bbox_inches="tight",
+    )
+
+    plt.close(figure)
+
+    # -----------------------------------------------------
+    # Figure 5: Successful TTR by Difficulty
+    # -----------------------------------------------------
+
+    if not successful.empty:
+        successful["difficulty_display"] = (
+            successful["difficulty"]
+            .map(DIFFICULTY_LABELS)
+            .fillna(successful["difficulty"])
+        )
+
+        ttr_data = [
+            successful.loc[
+                successful["difficulty_display"] == difficulty,
+                "ttr",
+            ]
+            .dropna()
+            .to_numpy()
+            for difficulty in difficulty_display_order
+        ]
+
+        non_empty = [
+            (
+                difficulty,
+                values,
+            )
+            for difficulty, values in zip(
+                difficulty_display_order,
+                ttr_data,
+                strict=True,
+            )
+            if len(values) > 0
+        ]
+
+        if non_empty:
+            labels = [item[0] for item in non_empty]
+
+            values = [item[1] for item in non_empty]
+
+            figure, axis = plt.subplots(figsize=(10, 5))
+
+            axis.boxplot(
+                values,
+                tick_labels=labels,
+                showmeans=True,
+            )
+
+            axis.set_title("Time to Resolution Distribution by Difficulty")
+
+            axis.set_xlabel("Difficulty")
+
+            axis.set_ylabel("TTR (seconds)")
+
+            axis.tick_params(
+                axis="x",
+                rotation=20,
+            )
+
+            figure.tight_layout()
+
+            figure.savefig(
+                os.path.join(
+                    graph_dir,
+                    "fig_05_ttr_by_difficulty.png",
+                ),
+                dpi=300,
+                bbox_inches="tight",
+            )
+
+            plt.close(figure)
+
+    # -----------------------------------------------------
+    # Figure 6: Iterations by Difficulty
+    # -----------------------------------------------------
+
+    successful_iterations = successful[successful["iterations"] > 0].copy()
+
+    if not successful_iterations.empty:
+        iteration_means = (
+            successful_iterations.groupby("difficulty_display")["iterations"]
+            .mean()
+            .reindex(difficulty_display_order)
+            .dropna()
+        )
+
+        figure, axis = plt.subplots(figsize=(9, 5))
+
+        iteration_means.plot(
+            kind="bar",
+            ax=axis,
+        )
+
+        axis.set_title("Mean Successful Repair Iterations by Difficulty")
+
+        axis.set_xlabel("Difficulty")
+
+        axis.set_ylabel("Mean Repair Iterations")
+
+        axis.tick_params(
+            axis="x",
+            rotation=20,
+        )
+
+        figure.tight_layout()
+
+        figure.savefig(
+            os.path.join(
+                graph_dir,
+                "fig_06_iterations_by_difficulty.png",
+            ),
+            dpi=300,
+            bbox_inches="tight",
+        )
+
+        plt.close(figure)
+
+    # -----------------------------------------------------
+    # Figure 7: Failure Reasons by Difficulty
+    # -----------------------------------------------------
+
+    failed = frame[~frame["passed"]].copy()
+
+    if not failed.empty:
+        failed["failure_reason"] = failed["failure_reason"].fillna(
+            "Unknown repair failure"
+        )
+
+        failure_pivot = (
+            failed.groupby(
+                [
+                    "difficulty_display",
+                    "failure_reason",
+                ]
+            )
+            .size()
+            .unstack(fill_value=0)
+            .reindex(difficulty_display_order)
+            .fillna(0)
+        )
+
+        figure, axis = plt.subplots(
+            figsize=(
+                11,
+                6,
+            )
+        )
+
+        failure_pivot.plot(
+            kind="bar",
+            stacked=True,
+            ax=axis,
+        )
+
+        axis.set_title("Failure Reasons by Difficulty")
+
+        axis.set_xlabel("Difficulty")
+
+        axis.set_ylabel("Failure Count")
+
+        axis.tick_params(
+            axis="x",
+            rotation=20,
+        )
+
+        axis.legend(
+            title="Failure Reason",
+            bbox_to_anchor=(
+                1.02,
+                1,
+            ),
+            loc="upper left",
+        )
+
+        figure.tight_layout()
+
+        figure.savefig(
+            os.path.join(
+                graph_dir,
+                "fig_07_failures_by_difficulty.png",
+            ),
+            dpi=300,
+            bbox_inches="tight",
+        )
+
+        plt.close(figure)
+
+    # -----------------------------------------------------
+    # Figure 8: Success Rate by Category
+    # -----------------------------------------------------
+
+    category_success = (
+        frame.groupby("category")["passed"].mean().mul(100).sort_values(ascending=False)
+    )
+
+    figure, axis = plt.subplots(
+        figsize=(
+            max(10, len(category_success) * 0.85),
+            5,
+        )
+    )
+
+    category_success.plot(
+        kind="bar",
+        ax=axis,
+    )
+
+    axis.set_title("Verified Repair Success Rate by Fault Category")
+
+    axis.set_xlabel("Fault Category")
+
+    axis.set_ylabel("Success Rate (%)")
+
+    axis.set_ylim(
+        0,
+        105,
+    )
+
+    axis.tick_params(
+        axis="x",
+        rotation=35,
+    )
+
+    figure.tight_layout()
+
+    figure.savefig(
+        os.path.join(
+            graph_dir,
+            "fig_08_success_rate_by_category.png",
+        ),
+        dpi=300,
+        bbox_inches="tight",
+    )
+
+    plt.close(figure)
+
+    success(f"8 academic figures generated in {graph_dir}")
+
+
+# =========================================================
+# Public Export Function
+# =========================================================
+
+
+def export_results(
+    raw_execution_data: list[dict[str, Any]],
+    run_dir: str,
+) -> None:
+    """
+    Export raw records, summaries, report and graphs.
+    """
+
+    os.makedirs(
+        run_dir,
+        exist_ok=True,
+    )
+
+    records = [normalise_record(record) for record in raw_execution_data]
+
+    by_model = summarise_records(
+        records,
+        ["model"],
+    )
+
+    by_difficulty = summarise_records(
+        records,
+        ["difficulty"],
+    )
+
+    by_model_difficulty = summarise_records(
+        records,
+        [
+            "model",
+            "difficulty",
+        ],
+    )
+
+    failure_summary = build_failure_summary(records)
+
+    write_csv(
+        os.path.join(
+            run_dir,
+            "dataset.csv",
+        ),
+        records,
+        DATASET_FIELDS,
+    )
+
+    write_csv(
+        os.path.join(
+            run_dir,
+            "summary_by_model.csv",
+        ),
+        by_model,
+    )
+
+    write_csv(
+        os.path.join(
+            run_dir,
+            "summary_by_difficulty.csv",
+        ),
+        by_difficulty,
+    )
+
+    write_csv(
+        os.path.join(
+            run_dir,
+            "summary_by_model_difficulty.csv",
+        ),
+        by_model_difficulty,
+    )
+
+    write_csv(
+        os.path.join(
+            run_dir,
+            "failure_summary.csv",
+        ),
+        failure_summary,
+    )
+
+    json_payload = {
+        "generated_at": (datetime.now().isoformat()),
+        "schema_version": "2.0",
+        "difficulty_definitions": {
+            "single_fault": {
+                "tier": 1,
+                "label": ("Single-Fault Repair"),
+                "definition": ("One intentionally seeded defect"),
+            },
+            "compound_same_category": {
+                "tier": 2,
+                "label": ("Homogeneous Compound-Fault Repair"),
+                "definition": ("Multiple defects from one fault category"),
+            },
+            "compound_cross_category": {
+                "tier": 3,
+                "label": ("Heterogeneous Compound-Fault Repair"),
+                "definition": ("Multiple defects from different categories"),
+            },
+        },
+        "records": records,
+        "summary_by_model": by_model,
+        "summary_by_difficulty": (by_difficulty),
+        "summary_by_model_difficulty": (by_model_difficulty),
+        "failure_summary": failure_summary,
+    }
+
+    with open(
+        os.path.join(
+            run_dir,
+            "dataset.json",
+        ),
+        "w",
+        encoding="utf-8",
+    ) as file_handle:
+        json.dump(
+            json_payload,
+            file_handle,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    write_analysis_report(
+        run_dir=run_dir,
+        records=records,
+        by_model=by_model,
+        by_difficulty=by_difficulty,
+        by_model_difficulty=(by_model_difficulty),
+        failure_summary=failure_summary,
+    )
+
+    success("CSV datasets and summaries exported.")
+
+    success("JSON advanced dataset exported.")
+
+    success("Markdown analysis report exported.")
+
+    logging.info("Data-science libraries detected. Generating academic figures...")
+
+    generate_graphs(
+        records,
+        run_dir,
+    )

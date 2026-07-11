@@ -1,291 +1,126 @@
+# src/agent/logic.py
 """
-CLEAR Agent Logic Module
+CLEAR Central Orchestrator
 
-Implements the LangGraph ReAct repair loop.
-
-Architecture:
-
-    Human
-      |
-      v
-    CLEAR Agent
-      |
-      v
- run_repair_attempt()
-      |
-      v
- Docker Sandbox
-      |
-      v
- Test Result
-      |
-      v
-    CLEAR Agent
-      |
-      v
- Verified Repair
-
-The LLM never executes code directly.
-All execution occurs inside SandboxManager.
+The declarative backbone of the self-healing framework. Composes modules
+from the `src/agent/` domain into a compiled LangGraph application.
+This is the only module external systems (e.g., src.main) need to import.
 """
 
-import os
-import sys
-import json
-import codecs
+from __future__ import annotations
 
-from typing import Annotated, Sequence
+from typing import Any
 
-from typing_extensions import TypedDict
-
-from dotenv import load_dotenv
-
-from langgraph.graph import StateGraph, END
-from langgraph.graph.message import add_messages
+from langchain_core.messages import AIMessage, HumanMessage
+from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import ToolNode
 
-from langchain_core.messages import (
-    BaseMessage,
-    SystemMessage,
-    HumanMessage,
-    AIMessage,
-    ToolMessage,
-)
-
-from langchain_ollama import ChatOllama
-
+from src.agent.candidate import convert_text_response_to_tool_call, normalise_args
+from src.agent.model_adapter import invoke_model
+from src.agent.routing import route_after_agent, route_after_tools
+from src.agent.state import AgentState
 from src.tools.agent_tools import run_repair_attempt
 
-from src.utils.config import OLLAMA_BASE_URL, MODEL_NAME, USE_REAL_LLM
-from src.utils.parsers import extract_json
+# =========================================================
+# Configuration
+# =========================================================
 
-
-# ==========================================================
-# Environment
-# ==========================================================
-
-load_dotenv()
-
-
-# ==========================================================
-# System Prompt
-# ==========================================================
-
-SYSTEM_PROMPT = """
-You are CLEAR, an autonomous Python repair agent.
-
-Your task:
-
-Repair the broken target.py program.
-
-You have exactly one tool:
-
-run_repair_attempt(
-    code,
-    test_suite
-)
-
-Rules:
-
-- code MUST contain ONLY the repaired target.py source (plain Python, no JSON, no markdown).
-- test_suite MUST be passed through UNCHANGED, exactly as given to you.
-- Never wrap code or test_suite in markdown fences.
-- Never put implementation code inside test_suite.
-- Never explain before a tool call.
-
-Workflow:
-
-1. Analyse the bug.
-2. Call run_repair_attempt with the repaired code and the unchanged test_suite.
-3. Read the execution result.
-4. If it failed: fix the code and retry.
-5. If it succeeded, reply with exactly:
-
-Repair complete.
-"""
-
-
-# ==========================================================
-# State
-# ==========================================================
-
-
-class AgentState(TypedDict):
-    messages: Annotated[Sequence[BaseMessage], add_messages]
-
-
-# ==========================================================
-# Tools
-# ==========================================================
-
+MAX_INVALID_RESPONSES = 3
 TOOLS = [run_repair_attempt]
 tool_node = ToolNode(TOOLS)
 
-
-# ==========================================================
-# LLM
-# ==========================================================
-
-SUPPORTED_TOOL_MODELS = ["qwen2.5", "llama3.1", "mistral"]
-
-SUPPORTS_NATIVE_TOOLS = any(x in MODEL_NAME.lower() for x in SUPPORTED_TOOL_MODELS)
+# =========================================================
+# Agent Node Definition
+# =========================================================
 
 
-if USE_REAL_LLM:
-    base_llm = ChatOllama(
-        model=MODEL_NAME,
-        base_url=OLLAMA_BASE_URL,
-        temperature=0,
+def call_model(state: AgentState) -> dict[str, Any]:
+    """
+    The computational core of the repair loop. Generates code, enforces
+    protocol constraints, applies fallbacks, and mutates the AgentState.
+    """
+    response, used_text_mode = invoke_model(state["messages"])
+    canonical_test_suite = state["test_suite"]
+
+    tool_calls = getattr(response, "tool_calls", None) or []
+
+    # Path A: The model natively formatted a valid tool call
+    if tool_calls and not used_text_mode:
+        normalised_calls = []
+
+        for index, tool_call in enumerate(tool_calls, start=1):
+            arguments = normalise_args(tool_call.get("args", {}))
+            candidate_code = arguments.get("code", "")
+
+            if not candidate_code.strip():
+                continue
+
+            normalised_calls.append(
+                {
+                    "name": "run_repair_attempt",
+                    "args": {
+                        "code": candidate_code,
+                        "test_suite": canonical_test_suite,
+                    },
+                    "id": tool_call.get("id", f"clear-native-call-{index}"),
+                }
+            )
+
+        if normalised_calls:
+            normalised_response = AIMessage(
+                content=response.content,
+                tool_calls=normalised_calls,
+            )
+            return {
+                "messages": [normalised_response],
+                "invalid_responses": 0,
+                "terminal_failure": None,
+            }
+
+    # Path B: The model produced text, applying Candidate Polyfill Layer
+    converted_response = convert_text_response_to_tool_call(
+        response_text=str(response.content),
+        canonical_test_suite=canonical_test_suite,
     )
 
-    llm_engine = base_llm.bind_tools(TOOLS) if SUPPORTS_NATIVE_TOOLS else base_llm
+    if converted_response is not None:
+        return {
+            "messages": [converted_response],
+            "invalid_responses": 0,
+            "terminal_failure": None,
+        }
 
-else:
+    # Path C: The model produced unparseable garbage; manage retry state
+    invalid_responses = state.get("invalid_responses", 0) + 1
 
-    class MockLLM:
-        def invoke(self, messages):
-            return AIMessage(content="Repair complete.")
+    if invalid_responses >= MAX_INVALID_RESPONSES:
+        return {
+            "messages": [response],
+            "invalid_responses": invalid_responses,
+            "terminal_failure": (
+                "Model protocol failure: no executable repair payload "
+                f"after {invalid_responses} responses"
+            ),
+        }
 
-    llm_engine = MockLLM()
-
-
-# ==========================================================
-# Tool-call payload normalisation
-# ==========================================================
-
-
-def _unwrap_value(value):
-    """
-    Small models sometimes double-wrap a string argument as
-    {"type": "string", "value": "..."}. Collapse that to the inner string.
-    """
-    if isinstance(value, dict):
-        if "value" in value and isinstance(value["value"], str):
-            return value["value"]
-        # Occasionally {"code": "..."} nested one level deeper.
-        for key in ("code", "source", "text"):
-            if key in value and isinstance(value[key], str):
-                return value[key]
-    return value
-
-
-def _decode_escapes(value):
-    """
-    When a JSON payload is reconstructed from text, its string values can
-    contain literal backslash-n sequences instead of real newlines, which
-    the sandbox then fails to parse. Decode those escapes, but only when the
-    string clearly contains them (avoid corrupting already-correct code).
-    """
-    if not isinstance(value, str):
-        return value
-    if "\\n" in value or "\\t" in value or '\\"' in value:
-        try:
-            return codecs.decode(value, "unicode_escape")
-        except Exception:
-            return value
-    return value
-
-
-def normalise_args(args: dict) -> dict:
-    """
-    Clean a tool-call argument dict so the sandbox receives valid raw Python.
-    Applies unwrapping and escape-decoding to both code and test_suite.
-    """
-    if not isinstance(args, dict):
-        return args
-
-    cleaned = dict(args)
-    for key in ("code", "test_suite"):
-        if key in cleaned:
-            cleaned[key] = _decode_escapes(_unwrap_value(cleaned[key]))
-    return cleaned
-
-
-# ==========================================================
-# Agent Node
-# ==========================================================
-
-
-def call_model(state: AgentState):
-    messages = list(state["messages"])
-
-    if not messages or not isinstance(messages[0], SystemMessage):
-        messages.insert(0, SystemMessage(content=SYSTEM_PROMPT))
-
-    response = llm_engine.invoke(messages)
-
-    # ----- Native tool calls: normalise their args in place -----
-    if getattr(response, "tool_calls", None):
-        fixed_calls = []
-        for call in response.tool_calls:
-            call = dict(call)
-            call["args"] = normalise_args(call.get("args", {}))
-            fixed_calls.append(call)
-        response = AIMessage(content=response.content, tool_calls=fixed_calls)
-
-    # ----- JSON polyfill: reconstruct a tool call from text -----
-    else:
-        payload = extract_json(str(response.content))
-        if payload:
-            args = payload.get("arguments", payload.get("args", payload))
-            args = normalise_args(args if isinstance(args, dict) else {})
-            if "code" in args:
-                response = AIMessage(
-                    content="",
-                    tool_calls=[
-                        {
-                            "name": "run_repair_attempt",
-                            "args": args,
-                            "id": "json-tool",
-                        }
-                    ],
-                )
-
-    if os.getenv("DEBUG"):
-        print(
-            "DEBUG TOOL CALLS:", getattr(response, "tool_calls", None), file=sys.stderr
+    feedback = HumanMessage(
+        content=(
+            "Your response could not be converted into a repair attempt. "
+            "Return only the complete repaired target.py inside one Python "
+            "Markdown code block. Do not include explanations."
         )
+    )
 
-    return {"messages": [response]}
-
-
-# ==========================================================
-# Routing
-# ==========================================================
-
-
-def should_continue(state):
-    """Graph router. Success is defined by a verified ToolMessage."""
-    last = state["messages"][-1]
-
-    if isinstance(last, HumanMessage):
-        return "agent"
-
-    if isinstance(last, AIMessage):
-        if getattr(last, "tool_calls", None):
-            return "tools"
-
-        content = str(getattr(last, "content", "")).lower()
-        # Only "repair complete" ends the loop. Do NOT match "success" here:
-        # the test suite itself may print SUCCESS.
-        if "repair complete" in content:
-            return "end"
-
-        return "agent"
-
-    if isinstance(last, ToolMessage):
-        # Terminate as soon as the oracle confirms a pass, regardless of how
-        # the model chooses to format its closing message afterwards.
-        #if "SUCCESS: All tests pass" in str(last.content):
-        #    return "end"
-        return "agent"
-
-    return "agent"
+    return {
+        "messages": [response, feedback],
+        "invalid_responses": invalid_responses,
+        "terminal_failure": None,
+    }
 
 
-# ==========================================================
-# Graph Construction
-# ==========================================================
+# =========================================================
+# Graph Compilation
+# =========================================================
 
 workflow = StateGraph(AgentState)
 
@@ -296,18 +131,22 @@ workflow.set_entry_point("agent")
 
 workflow.add_conditional_edges(
     "agent",
-    should_continue,
-    {"tools": "tools", "agent": "agent", "end": END},
+    route_after_agent,
+    {
+        "agent": "agent",
+        "tools": "tools",
+        "end": END,
+    },
 )
 
-# After a tool runs, route through the router so a verified pass can end the
-# loop immediately (instead of always bouncing back to the agent).
 workflow.add_conditional_edges(
     "tools",
-    should_continue,
-    {"agent": "agent", "end": END},
+    route_after_tools,
+    {
+        "agent": "agent",
+        "end": END,
+    },
 )
 
-workflow.add_edge("tools", "agent")
-
+# Exposed API for src.main.py execution
 clear_agent = workflow.compile()

@@ -1,0 +1,29 @@
+import threading
+import time
+
+
+class ResourceManager:
+    """
+    Manages two independent resources.
+
+    """
+
+    def __init__(self):
+        self.lock_a = threading.Lock()
+        self.lock_b = threading.Lock()
+        self.a_data = 0
+        self.b_data = 0
+
+    def lock_a_then_b(self):
+        with self.lock_a:
+            time.sleep(0.1)  # Force thread context switch
+            with self.lock_b:
+                self.a_data += 1
+                self.b_data += 1
+
+    def lock_b_then_a(self):
+        with self.lock_b:
+            time.sleep(0.1)
+            with self.lock_a:
+                self.b_data += 1
+                self.a_data += 1
