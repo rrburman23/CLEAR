@@ -87,6 +87,22 @@ ollama pull codegemma:7b
 
 ## Quick Start
 
+### Model configuration and available models
+
+- Single-run (`src.main`) uses the default model from `src/utils/config.py`:
+  - `MODEL_NAME = os.getenv("CLEAR_MODEL", "codegemma:7b")`
+- Benchmark model choices come from:
+  - `AVAILABLE_MODELS` in `src/utils/config.py`
+- To add a new benchmark model:
+  1. Add it to `AVAILABLE_MODELS`
+  2. Pull it locally with Ollama:
+     ```bash
+     ollama pull <model_name>
+     ```
+
+For full model/runtime setup details, see:
+- [`docs/models.md`](docs/models.md)
+
 ### 1) Validate benchmark structure (recommended)
 
 ```bash
@@ -212,6 +228,7 @@ CLEAR/
 │   ├── index.md
 │   ├── cli_reference.md
 │   ├── benchmark_spec.md
+│   ├── models.md
 │   ├── model_matrix.md
 │   ├── metrics.md
 │   ├── failure_taxonomy.md
