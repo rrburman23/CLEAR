@@ -12,15 +12,15 @@ passed the sandbox validation suite.
 from __future__ import annotations
 
 import argparse
-
 import json
 import logging
 import os
 import sys
 import time
 
-from typing import Any, Sequence, cast
+from contextlib import nullcontext
 from pathlib import Path
+from typing import Any, ContextManager, Sequence, cast
 
 from langchain_core.messages import (
     AIMessage,
@@ -31,6 +31,12 @@ from langchain_core.messages import (
 from langchain_core.runnables import RunnableConfig
 from langgraph.errors import GraphRecursionError
 
+from src.reporting.artifacts import (
+    create_standalone_run_directory,
+    mirror_console_output,
+    save_standalone_artifacts,
+)
+from src.utils.config import MODEL_NAME
 from src.agent.candidate import hash_candidate
 from src.agent.logic import clear_agent
 from src.agent.state import AgentState
@@ -55,7 +61,6 @@ DIFFICULTY_DIRECTORIES = {
 # =========================================================
 # Terminal Configuration
 # =========================================================
-
 
 def configure_logging() -> None:
     """
@@ -89,6 +94,90 @@ configure_logging()
 configure_utf8_stream(sys.stdout)
 configure_utf8_stream(sys.stderr)
 
+
+# =========================================================
+# Command-Line Interface
+# =========================================================
+
+
+def create_parser() -> argparse.ArgumentParser:
+    """
+    Create the command-line parser for one CLEAR repair execution.
+
+    Argument definition is kept separate from repair execution so that:
+
+    - main() handles command-line input;
+    - run_repair() handles the repair process;
+    - tests can construct an argparse.Namespace directly when needed.
+    """
+
+    parser = argparse.ArgumentParser(
+        prog="python -m src.main",
+        description=(
+            "Run one autonomous CLEAR software-repair task against a "
+            "target Python file and its verification suite."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+
+  Run one repair:
+      python -m src.main --code path/to/target.py --test path/to/test_target.py
+
+  Save standalone repair artefacts:
+      python -m src.main --code path/to/target.py --test path/to/test_target.py --save-run
+
+  Use a custom standalone output directory:
+      python -m src.main --code path/to/target.py --test path/to/test_target.py --save-run --log-dir tests/manual_runs
+""",
+    )
+
+    parser.add_argument(
+        "--code",
+        required=True,
+        metavar="PATH",
+        help="Path to the intentionally faulty target.py file.",
+    )
+
+    parser.add_argument(
+        "--test",
+        required=True,
+        metavar="PATH",
+        help="Path to the pytest verification suite.",
+    )
+
+    parser.add_argument(
+        "--recursion-limit",
+        type=int,
+        default=DEFAULT_RECURSION_LIMIT,
+        metavar="N",
+        help=(
+            f"Maximum LangGraph recursion steps. Default: {DEFAULT_RECURSION_LIMIT}."
+        ),
+    )
+
+    parser.add_argument(
+        "--save-run",
+        action="store_true",
+        help=(
+            "Save standalone execution artefacts including the original "
+            "source, test suite, repaired source, unified diff, result JSON, "
+            "and execution log."
+        ),
+    )
+
+    parser.add_argument(
+        "--log-dir",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Base directory for standalone repair artefacts. "
+            "Default: tests/logs/single_runs."
+        ),
+    )
+
+    return parser
 
 # =========================================================
 # CLEAR_RESULT Output
@@ -129,6 +218,7 @@ def print_result(
 # =========================================================
 # Benchmark Identification
 # =========================================================
+
 
 def get_benchmark_name(path: str) -> str:
     """
@@ -247,6 +337,7 @@ def find_latest_tool_failure(
 # Repair Attempt Counting
 # =========================================================
 
+
 def count_repair_attempts(
     messages: Sequence[BaseMessage],
 ) -> int:
@@ -272,6 +363,7 @@ def count_repair_attempts(
         attempts += 1
 
     return attempts
+
 
 # =========================================================
 # Failure Classification
@@ -336,10 +428,7 @@ def classify_tool_failure(payload: dict[str, Any] | None) -> str:
     ):
         return "Candidate runtime failure"
 
-    if any(
-        marker in combined_feedback
-        for marker in ("docker", "container", "daemon")
-    ):
+    if any(marker in combined_feedback for marker in ("docker", "container", "daemon")):
         return "Sandbox infrastructure failure"
 
     explicit_error = payload.get("error")
@@ -438,9 +527,7 @@ def display_stream_message(message: BaseMessage) -> None:
             candidate_code = tool_arguments.get("code")
 
             if isinstance(candidate_code, str) and candidate_code.strip():
-                candidate_hash = hash_candidate(
-                candidate_code
-                )
+                candidate_hash = hash_candidate(candidate_code)
 
                 print(
                     f"   Candidate: {candidate_hash} ({len(candidate_code)} characters)"
@@ -470,8 +557,9 @@ def apply_verified_repair(
     target_file: str,
     original_code: str,
     repaired_code: str,
-) -> None:
-    """Apply the exact candidate code that passed sandbox verification."""
+) -> str:
+    """Apply verified code and return its unified diff."""
+
     patch = generate_patch(
         original_code=original_code,
         repaired_code=repaired_code,
@@ -479,58 +567,60 @@ def apply_verified_repair(
     )
 
     info("\n--- VERIFIED PATCH ---")
+
     if patch.strip():
         print(patch)
     else:
         print("(The verified candidate is textually identical to the original source.)")
+
     info("----------------------\n")
 
-    with open(target_file, "w", encoding="utf-8") as file_handle:
+    with open(
+        target_file,
+        "w",
+        encoding="utf-8",
+    ) as file_handle:
         file_handle.write(repaired_code)
 
+    return patch
+
 
 # =========================================================
-# Main Execution
+# Repair Execution
 # =========================================================
 
 
-def main() -> None:
-    """Execute one CLEAR autonomous repair task."""
-    parser = argparse.ArgumentParser(
-        prog="CLEAR Single Execution Orchestrator",
-        description=(
-            "Run one sandbox-verified autonomous "
-            "Python repair task."
-        ),
+def run_repair(
+    args: argparse.Namespace,
+    standalone_run_directory: Path | None,
+) -> int:
+    """
+    Execute one autonomous repair task.
+
+    Args:
+        args:
+            Parsed command-line arguments.
+
+        standalone_run_directory:
+            Optional output directory for a manually requested standalone
+            execution. This remains None when src.main is launched by the
+            benchmark runner.
+
+    Returns:
+        Zero when a verified repair is successfully applied.
+        One when the repair fails or cannot be applied.
+    """
+    
+    if args.recursion_limit < 3:
+        raise ValueError("recursion_limit must be at least 3")
+    
+    target_file = os.path.abspath(
+        args.code
     )
 
-    parser.add_argument(
-        "--code",
-        required=True,
-        help="Path to the broken target.py",
+    test_file = os.path.abspath(
+        args.test
     )
-    parser.add_argument(
-        "--test",
-        required=True,
-        help="Path to the test_target.py oracle",
-    )
-    parser.add_argument(
-        "--recursion-limit",
-        type=int,
-        default=DEFAULT_RECURSION_LIMIT,
-        help=(
-            "LangGraph recursion limit. "
-            f"Default: {DEFAULT_RECURSION_LIMIT}."
-        ),
-    )
-
-    arguments = parser.parse_args()
-
-    if arguments.recursion_limit < 3:
-        parser.error("--recursion-limit must be at least 3.")
-
-    target_file = os.path.abspath(arguments.code)
-    test_file = os.path.abspath(arguments.test)
 
     benchmark_name = get_benchmark_name(target_file)
     benchmark_directory = os.path.dirname(target_file)
@@ -547,6 +637,8 @@ def main() -> None:
     execution_time = 0.0
     iterations = 0
     verified = False
+    repaired_code: str | None = None
+    repair_patch: str | None = None
 
     # =====================================================
     # Load Files
@@ -627,7 +719,7 @@ def main() -> None:
     }
 
     graph_config: RunnableConfig = {
-        "recursion_limit": arguments.recursion_limit,
+        "recursion_limit": args.recursion_limit,
     }
 
     final_state: AgentState | None = None
@@ -654,13 +746,9 @@ def main() -> None:
 
             final_state = typed_event
 
-            last_message = typed_event[
-                "messages"
-            ][-1]
+            last_message = typed_event["messages"][-1]
 
-            display_stream_message(
-                last_message
-            )
+            display_stream_message(last_message)
 
     except GraphRecursionError:
         recursion_error = True
@@ -668,7 +756,7 @@ def main() -> None:
 
     except KeyboardInterrupt:
         warning("Repair execution interrupted by the user.")
-        system_exception = KeyboardInterrupt() 
+        system_exception = KeyboardInterrupt()
 
     except Exception as exc:
         system_exception = exc
@@ -696,30 +784,52 @@ def main() -> None:
     # =====================================================
 
     if repaired_code is not None:
-        verified = True
-
         try:
-            apply_verified_repair(
+            repair_patch = apply_verified_repair(
                 target_file=target_file,
                 original_code=broken_code,
                 repaired_code=repaired_code,
             )
 
         except OSError as exc:
-            failure_reason = f"Verified repair could not be applied: {exc}"
-            failure(f"REPAIR_FAILED | Benchmark={benchmark_name} | Reason={failure_reason}")
+            verified = False
+            status = "FAILED"
+            failure_reason = (
+                f"Verified repair could not be applied: {exc}"
+            )
+
+            failure(
+                f"REPAIR_FAILED | Benchmark={benchmark_name} | "
+                f"Reason={failure_reason}"
+            )
 
         else:
+            verified = True
             status = "SUCCESS"
             failure_reason = None
 
-            success(f"REPAIR_SUCCESS | Benchmark={benchmark_name} | Iterations={iterations}")
-            success(f"Successfully applied verified repair to {target_file}")
+            success(
+                f"REPAIR_SUCCESS | Benchmark={benchmark_name} | "
+                f"Iterations={iterations}"
+            )
+
+            success(
+                f"Successfully applied verified repair to {target_file}"
+            )
 
             if successful_payload:
-                sandbox_output = str(successful_payload.get("output", "")).strip()
+                sandbox_output = str(
+                    successful_payload.get(
+                        "output",
+                        "",
+                    )
+                ).strip()
+
                 if sandbox_output:
-                    info(f"Sandbox verification output: {sandbox_output}")
+                    info(
+                        f"Sandbox verification output: "
+                        f"{sandbox_output}"
+                    )
 
     # =====================================================
     # Failed Repair
@@ -736,10 +846,7 @@ def main() -> None:
             failure_reason = protocol_failure
 
         elif recursion_error:
-            failure_reason = (
-                "Repair budget exhausted "
-                "(Graph recursion limit)"
-            )
+            failure_reason = "Repair budget exhausted (Graph recursion limit)"
 
         elif isinstance(
             system_exception,
@@ -749,20 +856,14 @@ def main() -> None:
 
         elif system_exception is not None:
             failure_reason = (
-                "System crash: "
-                f"{type(system_exception).__name__}: "
-                f"{system_exception}"
+                f"System crash: {type(system_exception).__name__}: {system_exception}"
             )
 
         elif iterations == 0:
-            failure_reason = (
-                "No valid repair attempt generated"
-            )
+            failure_reason = "No valid repair attempt generated"
 
         else:
-            failure_reason = classify_tool_failure(
-                latest_failure
-            )
+            failure_reason = classify_tool_failure(latest_failure)
 
         failure(
             f"REPAIR_FAILED | Benchmark={benchmark_name} | "
@@ -786,6 +887,25 @@ def main() -> None:
     # =====================================================
     # Emit Structured Result
     # =====================================================
+    result_payload = {
+        "status": status,
+        "benchmark": benchmark_name,
+        "model": MODEL_NAME,
+        "reason": failure_reason,
+        "time": execution_time,
+        "iterations": iterations,
+        "verified": verified,
+    }
+
+    if standalone_run_directory is not None:
+        save_standalone_artifacts(
+            run_directory=standalone_run_directory,
+            original_code=broken_code,
+            test_suite=test_suite,
+            repaired_code=repaired_code,
+            patch=repair_patch,
+            result=result_payload,
+        )
 
     print_result(
         status=status,
@@ -796,14 +916,70 @@ def main() -> None:
         verified=verified,
     )
 
-    if status != "SUCCESS":
-        raise SystemExit(1)
+    return 0 if verified else 1
 
 
 # =========================================================
-# Program Entry Point
+# Main Entry Point
 # =========================================================
+
+
+def main() -> int:
+    """
+    Parse command-line arguments and optionally enable standalone logging.
+    """
+
+    parser = create_parser()
+    args = parser.parse_args()
+
+    if args.recursion_limit < 3:
+        parser.error("--recursion-limit must be at least 3.")
+
+    benchmark_name = get_benchmark_name(args.code)
+
+    benchmark_mode = (
+        os.getenv(
+            "CLEAR_BENCHMARK_MODE",
+            "false",
+        ).lower()
+        == "true"
+    )
+
+    standalone_run_directory: Path | None = None
+
+    if args.save_run and not benchmark_mode:
+        standalone_run_directory = create_standalone_run_directory(
+            model=MODEL_NAME,
+            benchmark=benchmark_name,
+            base_directory=args.log_dir,
+        )
+
+    elif args.save_run and benchmark_mode:
+        warning(
+            "--save-run was ignored because src.main is running "
+            "under the benchmark runner."
+        )
+
+    output_context: ContextManager[None]
+
+    if standalone_run_directory is not None:
+        output_context = mirror_console_output(
+            standalone_run_directory / "execution.log"
+        )
+    else:
+        output_context = nullcontext()
+
+    with output_context:
+        exit_code = run_repair(
+            args=args,
+            standalone_run_directory=standalone_run_directory,
+        )
+
+        if standalone_run_directory is not None:
+            info(f"Standalone artefacts saved to: {standalone_run_directory}")
+
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

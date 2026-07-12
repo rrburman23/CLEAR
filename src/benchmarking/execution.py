@@ -17,10 +17,19 @@ from src.benchmarking.failures import (
     normalise_timeout_output,
 )
 from src.benchmarking.models import BenchmarkResult, BenchmarkTask
+from src.utils.diff import generate_patch
 
 
-def _coerce_int(value: Any, default: int = 0) -> int:
-    """Convert an arbitrary telemetry value to ``int`` safely."""
+# =========================================================
+# Telemetry Conversion
+# =========================================================
+
+
+def _coerce_int(
+    value: Any,
+    default: int = 0,
+) -> int:
+    """Convert an arbitrary telemetry value to an integer safely."""
 
     try:
         return int(value)
@@ -28,8 +37,11 @@ def _coerce_int(value: Any, default: int = 0) -> int:
         return default
 
 
-def _coerce_float(value: Any, default: float) -> float:
-    """Convert an arbitrary telemetry value to ``float`` safely."""
+def _coerce_float(
+    value: Any,
+    default: float,
+) -> float:
+    """Convert an arbitrary telemetry value to a float safely."""
 
     try:
         return float(value)
@@ -37,27 +49,110 @@ def _coerce_float(value: Any, default: float) -> float:
         return default
 
 
-def _build_environment(model: str, project_root: str) -> dict[str, str]:
-    """Build the child-process environment for one model execution."""
+# =========================================================
+# Child-Process Environment
+# =========================================================
 
-    environment = os.environ.copy()
-    environment["CLEAR_MODEL"] = model
 
-    existing_pythonpath = environment.get("PYTHONPATH", "")
+def _build_environment(
+    model: str,
+    project_root: str,
+) -> dict[str, str]:
+    """
+    Build the environment for one src.main child process.
 
-    environment["PYTHONPATH"] = (
-        project_root
-        if not existing_pythonpath
-        else project_root + os.pathsep + existing_pythonpath
+    CLEAR_BENCHMARK_MODE prevents src.main from creating a separate
+    standalone logging directory for every model-benchmark pair.
+    """
+
+    custom_environment = os.environ.copy()
+
+    custom_environment["CLEAR_MODEL"] = model
+    custom_environment["CLEAR_BENCHMARK_MODE"] = "true"
+
+    existing_pythonpath = custom_environment.get(
+        "PYTHONPATH",
+        "",
     )
 
-    return environment
+    if existing_pythonpath:
+        custom_environment["PYTHONPATH"] = (
+            project_root + os.pathsep + existing_pythonpath
+        )
+    else:
+        custom_environment["PYTHONPATH"] = project_root
+
+    return custom_environment
 
 
-def _restore_target(target_file: Path, original_code: str) -> None:
-    """Restore the exact source captured before benchmark execution."""
+# =========================================================
+# Benchmark Source Restoration
+# =========================================================
 
-    target_file.write_text(original_code, encoding="utf-8")
+
+def _restore_target(
+    target_path: Path,
+    original_code: str,
+) -> None:
+    """Restore the exact faulty source captured before execution."""
+
+    target_path.write_text(
+        original_code,
+        encoding="utf-8",
+    )
+
+
+# =========================================================
+# Verified Repair Capture
+# =========================================================
+
+
+def _capture_verified_repair(
+    *,
+    target_path: Path,
+    original_code: str,
+    benchmark_id: str,
+) -> tuple[str | None, str | None]:
+    """
+    Capture repaired source and its unified diff before target restoration.
+
+    Returns:
+        A tuple containing:
+
+        - repaired source code;
+        - unified diff patch.
+
+    The patch is None when the verified candidate is textually identical
+    to the original source.
+    """
+
+    try:
+        repaired_code = target_path.read_text(encoding="utf-8")
+
+    except OSError as exc:
+        logging.error(
+            "Verified repair artefact could not be read for %s: %s",
+            benchmark_id,
+            exc,
+        )
+
+        return None, None
+
+    repair_patch: str | None = None
+
+    if repaired_code != original_code:
+        repair_patch = generate_patch(
+            original_code=original_code,
+            repaired_code=repaired_code,
+            filename=target_path.name,
+        )
+
+    return repaired_code, repair_patch
+
+
+# =========================================================
+# Individual Benchmark Execution
+# =========================================================
 
 
 def execute_benchmark(
@@ -68,14 +163,19 @@ def execute_benchmark(
     timeout_seconds: float,
     max_iterations: int,
 ) -> BenchmarkResult:
-    """Execute one model against one benchmark in a child process.
+    """
+    Execute one model against one benchmark in a child process.
 
-    The function always restores the original faulty ``target.py`` in a
-    ``finally`` block.  This guarantees that every model receives identical
-    seeded source code even when the child process fails or times out.
+    The original faulty target is always restored in a finally block. This
+    guarantees that every model receives the same seeded source program.
+
+    A verified repair is captured before restoration so the reporting layer
+    can export the repaired source and unified diff.
     """
 
     target_path = Path(task.target_file)
+    benchmark_id = task.benchmark_id
+
     original_code = target_path.read_text(encoding="utf-8")
 
     command = [
@@ -89,10 +189,15 @@ def execute_benchmark(
     ]
 
     process_returncode: int | None = None
+
     stdout = ""
     stderr = ""
+
     clear_result: dict[str, Any] | None = None
     timed_out = False
+
+    repaired_code: str | None = None
+    repair_patch: str | None = None
 
     wall_start = time.perf_counter()
 
@@ -103,7 +208,10 @@ def execute_benchmark(
             text=True,
             encoding="utf-8",
             errors="replace",
-            env=_build_environment(model, project_root),
+            env=_build_environment(
+                model,
+                project_root,
+            ),
             cwd=task.root,
             timeout=timeout_seconds,
             check=False,
@@ -112,16 +220,39 @@ def execute_benchmark(
         process_returncode = process.returncode
         stdout = process.stdout or ""
         stderr = process.stderr or ""
+
         clear_result = extract_clear_result(stdout)
+
+        provisional_success = bool(
+            clear_result
+            and str(
+                clear_result.get(
+                    "status",
+                    "",
+                )
+            ).upper()
+            == "SUCCESS"
+            and clear_result.get("verified") is True
+        )
+
+        # This must happen before the finally block restores target.py.
+        if provisional_success:
+            repaired_code, repair_patch = _capture_verified_repair(
+                target_path=target_path,
+                original_code=original_code,
+                benchmark_id=benchmark_id,
+            )
 
     except subprocess.TimeoutExpired as exc:
         timed_out = True
+
         stdout = normalise_timeout_output(exc.stdout)
+
         stderr = normalise_timeout_output(exc.stderr)
 
         logging.error(
             "%s timed out after %.2f seconds.",
-            task.benchmark_id,
+            benchmark_id,
             timeout_seconds,
         )
 
@@ -130,12 +261,16 @@ def execute_benchmark(
 
         logging.exception(
             "Unexpected execution error for %s.",
-            task.benchmark_id,
+            benchmark_id,
         )
 
     finally:
         try:
-            _restore_target(target_path, original_code)
+            _restore_target(
+                target_path,
+                original_code,
+            )
+
         except OSError as restore_error:
             logging.critical(
                 "Unable to restore benchmark source %s: %s",
@@ -145,6 +280,10 @@ def execute_benchmark(
 
     wall_time = time.perf_counter() - wall_start
 
+    # =====================================================
+    # Authoritative Result Interpretation
+    # =====================================================
+
     fallback_iterations = count_repair_attempts(stdout)
 
     if clear_result:
@@ -152,22 +291,32 @@ def execute_benchmark(
             clear_result.get("iterations"),
             fallback_iterations,
         )
-        ttr = _coerce_float(clear_result.get("time"), wall_time)
-        status = str(clear_result.get("status", "")).upper()
+
+        ttr = _coerce_float(
+            clear_result.get("time"),
+            wall_time,
+        )
+
+        status = str(
+            clear_result.get(
+                "status",
+                "",
+            )
+        ).upper()
+
         verified = clear_result.get("verified") is True
 
         passed = bool(
-            status == "SUCCESS"
-            and verified
-            and 0 < iterations <= max_iterations
+            status == "SUCCESS" and verified and 0 < iterations <= max_iterations
         )
+
     else:
         iterations = fallback_iterations
         ttr = wall_time
         verified = False
         passed = False
 
-    failure_reason = None
+    failure_reason: str | None = None
 
     if not passed:
         failure_reason = derive_failure_reason(
@@ -183,8 +332,9 @@ def execute_benchmark(
         logging.warning(
             (
                 "Repair failed | Model=%s | Difficulty=%s | Tier=%s | "
-                "Category=%s | Benchmark=%s | Reason=%s | Iterations=%d | "
-                "TTR=%.3fs | WallTime=%.3fs | ReturnCode=%s"
+                "Category=%s | Benchmark=%s | Reason=%s | "
+                "Iterations=%d | TTR=%.3fs | WallTime=%.3fs | "
+                "ReturnCode=%s"
             ),
             model,
             task.difficulty.name,
@@ -198,19 +348,24 @@ def execute_benchmark(
             process_returncode,
         )
 
-        if stdout.strip():
-            logging.warning(
-                "Child stdout for %s:\n%s",
-                task.benchmark_id,
-                stdout,
-            )
+        # Do not export apparent repair artefacts for an invalid success.
+        repaired_code = None
+        repair_patch = None
 
-        if stderr.strip():
-            logging.warning(
-                "Child stderr for %s:\n%s",
-                task.benchmark_id,
-                stderr,
-            )
+    # Preserve child output for successful and failed attempts.
+    if stdout.strip():
+        logging.info(
+            "Child stdout for %s:\n%s",
+            benchmark_id,
+            stdout,
+        )
+
+    if stderr.strip():
+        logging.warning(
+            "Child stderr for %s:\n%s",
+            benchmark_id,
+            stderr,
+        )
 
     return BenchmarkResult(
         model=model,
@@ -221,7 +376,7 @@ def execute_benchmark(
         difficulty_definition=task.difficulty.definition,
         category=task.category,
         benchmark=task.benchmark,
-        benchmark_id=task.benchmark_id,
+        benchmark_id=benchmark_id,
         passed=passed,
         verified=verified,
         ttr=ttr,
@@ -230,4 +385,6 @@ def execute_benchmark(
         failure_reason=failure_reason,
         return_code=process_returncode,
         timed_out=timed_out,
+        _repair_patch=repair_patch,
+        _repaired_code=repaired_code,
     )

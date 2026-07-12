@@ -26,6 +26,7 @@ AVAILABLE_MODELS = [
     "mistral-nemo:12b",
     # 4. Intrinsic Reasoning (Test-Time Compute)
     "deepseek-r1:8b",
+    "ornith:9b",
     # 5. The "Cognitive Floor" (Resource-Efficient)
     "phi3:mini",
     "qwen2.5-coder:3b",
@@ -38,6 +39,7 @@ SUPPORTED_TOOL_MODELS = [
     "mistral-nemo",
     "codegemma",
     "codellama",
+    "ornith",
 ]
 SUPPORTS_NATIVE_TOOLS = any(x in MODEL_NAME.lower() for x in SUPPORTED_TOOL_MODELS)
 

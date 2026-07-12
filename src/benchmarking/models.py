@@ -72,6 +72,11 @@ class BenchmarkResult:
     failure_reason: str | None
     return_code: int | None
     timed_out: bool
+    
+    # Internal reporting fields. These are removed before public CSV/JSON
+    # export after the artefact files have been materialised.
+    _repair_patch: str | None = None
+    _repaired_code: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return a serialisable representation of the result."""

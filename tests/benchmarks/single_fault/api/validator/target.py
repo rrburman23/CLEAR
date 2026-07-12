@@ -3,7 +3,7 @@ def validate_email(email: str) -> bool:
     Return True when email has a non-empty local part and a valid-looking
     dotted domain.
 
-    
+
     """
 
     if not isinstance(email, str):
@@ -25,5 +25,4 @@ def validate_email(email: str) -> bool:
 
     domain_parts = domain.split(".")
 
-    
     return len(domain_parts) == 1 and all(domain_parts)
