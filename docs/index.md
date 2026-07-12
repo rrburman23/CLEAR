@@ -53,3 +53,4 @@ If you're writing results/analysis:
 - `README.md` is the canonical project front page.
 - Files in `docs/` provide detailed, task-specific reference material.
 - Keep CLI docs synced with `argparse` definitions in source code.
+  

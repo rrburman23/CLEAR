@@ -1,5 +1,5 @@
 import pytest
-from.target import fibonacci
+from target import fibonacci
 
 
 def test_normal_case() -> None:
