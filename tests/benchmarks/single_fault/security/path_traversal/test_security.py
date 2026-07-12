@@ -1,20 +1,64 @@
+from pathlib import Path
+
 import pytest
-from target import get_user_file
+
+import target
 
 
-def test_valid_file() -> None:
-    # Assuming user.txt exists in /app/data/
-    # Setup: we use a mock-like approach or assume files exist in container
-    with pytest.raises(FileNotFoundError):
-        get_user_file("does_not_exist.txt")
+def test_valid_file_inside_base_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base_directory = tmp_path / "data"
+    base_directory.mkdir()
+
+    allowed_file = base_directory / "allowed.txt"
+    allowed_file.write_text("allowed", encoding="utf-8")
+
+    monkeypatch.setattr(
+        target,
+        "BASE_DIRECTORY",
+        base_directory,
+    )
+
+    assert target.get_user_file("allowed.txt") == "allowed"
 
 
-def test_traversal_attempt() -> None:
-    # The application should restrict access to the /app/data/ directory
-    with pytest.raises(Exception):
-        get_user_file("../target.py")
+def test_parent_directory_traversal_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base_directory = tmp_path / "data"
+    base_directory.mkdir()
+
+    secret_file = tmp_path / "secret.txt"
+    secret_file.write_text("secret", encoding="utf-8")
+
+    monkeypatch.setattr(
+        target,
+        "BASE_DIRECTORY",
+        base_directory,
+    )
+
+    with pytest.raises(ValueError):
+        target.get_user_file("../secret.txt")
 
 
-def test_absolute_path_traversal() -> None:
-    with pytest.raises(Exception):
-        get_user_file("/etc/passwd")
+def test_absolute_path_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base_directory = tmp_path / "data"
+    base_directory.mkdir()
+
+    outside_file = tmp_path / "outside.txt"
+    outside_file.write_text("outside", encoding="utf-8")
+
+    monkeypatch.setattr(
+        target,
+        "BASE_DIRECTORY",
+        base_directory,
+    )
+
+    with pytest.raises(ValueError):
+        target.get_user_file(str(outside_file))

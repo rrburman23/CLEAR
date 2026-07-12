@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from src.benchmarking.constants import EXPERIMENT_TYPE
+from src.utils.config import EXPERIMENT_TYPE
 from src.benchmarking.difficulty import DIFFICULTIES, ordered_difficulties
 from src.benchmarking.discovery import discover_benchmarks
 from src.benchmarking.execution import execute_benchmark

@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from src.benchmarking.constants import DATASET_FIELDS
+from src.utils.config import DATASET_FIELDS
 from src.benchmarking.difficulty import ordered_difficulties
 from src.benchmarking.metrics import (
     build_failure_summary,
@@ -27,7 +27,15 @@ from src.reporting.markdown import (
     MODEL_DIFFICULTY_COLUMNS,
     write_analysis_report,
 )
-from src.reporting.tables import write_csv, write_latex_table
+from src.reporting.tables import (
+    write_csv,
+    write_latex_table,
+    build_failure_summary as build_failure_summary_global,
+    build_failures_by_model,
+    build_hardest_benchmarks,
+    build_pass_at_k_summary,
+    build_efficiency_leaderboard,
+)
 from src.utils.terminal import success, warning
 
 
@@ -52,7 +60,6 @@ CATEGORY_COLUMNS = [
 
 def _difficulty_definitions() -> dict[str, dict[str, Any]]:
     """Return canonical tier metadata for JSON export."""
-
     return {
         item.name: {
             "tier": item.tier,
@@ -71,10 +78,9 @@ def _write_json_dataset(
     records: list[dict[str, Any]],
     summaries: dict[str, list[dict[str, Any]]],
 ) -> None:
-    """Write raw results and every aggregate table to one JSON document."""
-
+    """Write raw results and aggregate tables to one JSON document."""
     payload = {
-        "schema_version": "3.0",
+        "schema_version": "4.0",
         "generated_at": datetime.now().isoformat(),
         "experiment_settings": settings.to_dict(),
         "difficulty_definitions": _difficulty_definitions(),
@@ -97,8 +103,7 @@ def _write_latex_tables(
     summary_by_category: list[dict[str, Any]],
     failure_summary: list[dict[str, Any]],
 ) -> None:
-    """Write dissertation-ready LaTeX versions of the main summary tables."""
-
+    """Write dissertation-ready LaTeX versions of core summary tables."""
     write_latex_table(
         tables_directory / "summary_by_model.tex",
         summary_by_model,
@@ -147,7 +152,6 @@ def export_experiment(
     settings: ExperimentSettings,
 ) -> None:
     """Export raw data, summaries, report, LaTeX tables, and figures."""
-
     run_dir = Path(run_directory)
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -158,6 +162,7 @@ def export_experiment(
 
     records = [result.to_dict() for result in results]
 
+    # Existing benchmarking.metrics summaries
     summary_by_model = summarise_by_model(results)
     summary_by_difficulty = summarise_by_difficulty(results)
     summary_by_category = summarise_by_category(results)
@@ -165,6 +170,13 @@ def export_experiment(
     summary_by_model_category = summarise_by_model_category(results)
     summary_by_difficulty_category = summarise_by_difficulty_category(results)
     failure_summary = build_failure_summary(results)
+
+    # New richer reporting tables (from src.reporting.tables)
+    failure_summary_global = build_failure_summary_global(results)
+    failures_by_model = build_failures_by_model(results)
+    hardest_benchmarks = build_hardest_benchmarks(results, top_n=20)
+    pass_at_k_summary = build_pass_at_k_summary(results, ks=(1, 2, 3, 5))
+    efficiency_leaderboard = build_efficiency_leaderboard(results)
 
     summaries = {
         "summary_by_model": summary_by_model,
@@ -174,20 +186,24 @@ def export_experiment(
         "summary_by_model_category": summary_by_model_category,
         "summary_by_difficulty_category": summary_by_difficulty_category,
         "failure_summary": failure_summary,
+        "failure_summary_global": failure_summary_global,
+        "failures_by_model": failures_by_model,
+        "hardest_benchmarks": hardest_benchmarks,
+        "pass_at_k_summary": pass_at_k_summary,
+        "efficiency_leaderboard": efficiency_leaderboard,
     }
 
+    # Raw dataset
     write_csv(run_dir / "dataset.csv", records, DATASET_FIELDS)
+
+    # Existing aggregate tables
     write_csv(tables_dir / "summary_by_model.csv", summary_by_model)
     write_csv(tables_dir / "summary_by_difficulty.csv", summary_by_difficulty)
     write_csv(tables_dir / "summary_by_category.csv", summary_by_category)
     write_csv(
-        tables_dir / "summary_by_model_difficulty.csv",
-        summary_by_model_difficulty,
+        tables_dir / "summary_by_model_difficulty.csv", summary_by_model_difficulty
     )
-    write_csv(
-        tables_dir / "summary_by_model_category.csv",
-        summary_by_model_category,
-    )
+    write_csv(tables_dir / "summary_by_model_category.csv", summary_by_model_category)
     write_csv(
         tables_dir / "summary_by_difficulty_category.csv",
         summary_by_difficulty_category,
@@ -205,6 +221,64 @@ def export_experiment(
         ],
     )
 
+    # New reporting tables
+    write_csv(
+        tables_dir / "failure_summary_global.csv",
+        failure_summary_global,
+        ["failure_reason", "count", "share_of_failures_pct"],
+    )
+    write_csv(
+        tables_dir / "failures_by_model.csv",
+        failures_by_model,
+        ["model", "failure_reason", "count", "share_of_model_failures_pct"],
+    )
+    write_csv(
+        tables_dir / "hardest_benchmarks.csv",
+        hardest_benchmarks,
+        [
+            "difficulty",
+            "category",
+            "benchmark",
+            "attempts",
+            "successes",
+            "failures",
+            "success_rate_pct",
+            "pass_at_1_pct",
+            "mean_ttr_s",
+            "mean_wall_time_s",
+            "iteration_efficiency",
+            "average_repair_iterations",
+            "failure_rate_pct",
+            "most_common_failure_reason",
+        ],
+    )
+    write_csv(
+        tables_dir / "pass_at_k_summary.csv",
+        pass_at_k_summary,
+        [
+            "model",
+            "attempts",
+            "pass_at_1_pct",
+            "pass_at_2_pct",
+            "pass_at_3_pct",
+            "pass_at_5_pct",
+        ],
+    )
+    write_csv(
+        tables_dir / "efficiency_leaderboard.csv",
+        efficiency_leaderboard,
+        [
+            "model",
+            "attempts",
+            "success_rate_pct",
+            "pass_at_1_pct",
+            "mean_ttr_s",
+            "average_repair_iterations",
+            "iteration_efficiency",
+            "failure_rate_pct",
+        ],
+    )
+
     _write_json_dataset(
         run_dir / "dataset.json",
         settings=settings,
@@ -219,7 +293,11 @@ def export_experiment(
         summary_by_model=summary_by_model,
         summary_by_difficulty=summary_by_difficulty,
         summary_by_model_difficulty=summary_by_model_difficulty,
-        failure_summary=failure_summary,
+        failure_summary=failure_summary_global,  # use global failure view in report
+        summary_by_category=summary_by_category,
+        failures_by_model=failures_by_model,
+        hardest_benchmarks=hardest_benchmarks,
+        pass_at_k_summary=pass_at_k_summary,
     )
 
     _write_latex_tables(
@@ -236,10 +314,9 @@ def export_experiment(
     success("Markdown analysis report exported.")
 
     generated_figures = generate_graphs(results, graphs_dir)
-
     if generated_figures:
         success(f"{generated_figures} academic figures generated in {graphs_dir}")
     else:
-        warning("No figures were generated. Check the dataset and plotting dependencies.")
+        warning("No figures were generated. Check dataset and plotting dependencies.")
 
     logging.info("Result export completed for %d benchmark attempts.", len(results))

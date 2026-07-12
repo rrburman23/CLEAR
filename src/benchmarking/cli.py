@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 
-from src.benchmarking.constants import (
+from src.utils.config import (
     AVAILABLE_MODELS,
     AVAILABLE_TYPES,
     DEFAULT_BENCHMARK_TIMEOUT,

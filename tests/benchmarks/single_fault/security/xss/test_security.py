@@ -8,14 +8,18 @@ def test_normal_name() -> None:
 
 
 def test_script_tag_is_escaped() -> None:
-    rendered = render_greeting("<script>alert(1)</script>")
+    rendered = render_greeting(
+        "<script>alert(1)</script>"
+    )
 
     assert "<script" not in rendered.lower()
     assert "&lt;script" in rendered.lower()
 
 
 def test_attribute_injection_is_inert() -> None:
-    rendered = render_greeting("Alice!</h1><img src=x onerror=alert(1)>")
+    rendered = render_greeting(
+        "Alice!</h1><img src=x onerror=alert(1)>"
+    )
 
     lowered = rendered.lower()
 

@@ -1,6 +1,10 @@
 """
 CLEAR Global Configuration Module
 Ensures environment variables and capabilities are loaded exactly once.
+"from src.benchmarking import constants
+
+
+Central configuration constants for CLEAR benchmark experiments.
 """
 
 import os
@@ -41,6 +45,48 @@ SUPPORTED_TOOL_MODELS = [
     "codellama",
     "ornith",
 ]
+
+AVAILABLE_TYPES = [
+    "algorithm",
+    "api",
+    "concurrency",
+    "data_structure",
+    "edge_case",
+    "exception",
+    "logic",
+    "mixed",
+    "oop",
+    "python",
+    "security",
+    "syntax",
+]
+
+# Raw per-attempt fields exported to dataset.csv.
+DATASET_FIELDS = [
+    "model",
+    "difficulty",
+    "difficulty_tier",
+    "difficulty_code",
+    "difficulty_label",
+    "difficulty_definition",
+    "category",
+    "benchmark",
+    "benchmark_id",
+    "passed",
+    "verified",
+    "ttr",
+    "wall_time",
+    "iterations",
+    "failure_reason",
+    "return_code",
+    "timed_out",
+]
+
+
+DEFAULT_MAX_ITERATIONS = 15
+DEFAULT_BENCHMARK_TIMEOUT = 300.0
+EXPERIMENT_TYPE = "automated_repair"
+
 SUPPORTS_NATIVE_TOOLS = any(x in MODEL_NAME.lower() for x in SUPPORTED_TOOL_MODELS)
 
 # Directory paths
