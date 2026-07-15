@@ -11,7 +11,8 @@ def test_admin_user() -> None:
 
 
 def test_sql_injection_attempt() -> None:
-    # Malicious username should not return all secrets
     results = get_user_data("' OR '1'='1")
-    assert len(results) == 1  # Should only return 1, not both secrets
+
+    assert results == []
     assert "super_secret" not in results
+    assert "hello" not in results

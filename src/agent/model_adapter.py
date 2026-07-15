@@ -1,21 +1,15 @@
 """
-CLEAR LLM Adapter
+CLEAR Model Adapter
 
-Initialises the configured Ollama model and adapts graph message history for:
+Provides one protocol-normalised inference path for all evaluated models.
 
-- models supporting native tool calls;
-- text-only models requiring a compatibility layer.
-
-The adapter does not perform candidate tracking. Candidate tracking belongs
-to the graph's agent node after the final executable tool call is constructed.
+The principal experiment does not use native tool calling. Every model receives
+a compact repair prompt and returns Python source only.
 """
 
 from __future__ import annotations
 
-import json
-import os
-import sys
-from collections.abc import Mapping
+import logging
 from typing import Any, Sequence
 
 from langchain_core.messages import (
@@ -28,15 +22,18 @@ from langchain_core.messages import (
 from langchain_ollama import ChatOllama
 
 from src.agent.candidate import (
-    normalise_args,
     parse_tool_payload,
+    strip_reasoning_blocks,
 )
-from src.agent.prompts import get_system_prompt
-from src.tools.agent_tools import run_repair_attempt
+from src.agent.prompts import (
+    CODE_ONLY_SYSTEM_PROMPT,
+    build_compact_repair_prompt,
+)
+from src.agent.state import AgentState
 from src.utils.config import (
     MODEL_NAME,
+    MODEL_PROFILE,
     OLLAMA_BASE_URL,
-    SUPPORTS_NATIVE_TOOLS,
     USE_REAL_LLM,
 )
 
@@ -46,10 +43,11 @@ from src.utils.config import (
 # =========================================================
 
 
+logger = logging.getLogger(__name__)
+
+
 class MockLLM:
-    """
-    Development-only model used when real inference is disabled.
-    """
+    """Development-only code-output model."""
 
     def invoke(
         self,
@@ -58,293 +56,296 @@ class MockLLM:
         del messages
 
         return AIMessage(
-            content=("```python\ndef mock_repair():\n    return True\n```")
+            content=("```python\ndef placeholder() -> bool:\n    return True\n```")
         )
 
 
-def initialize_engines() -> tuple[Any, Any | None]:
+def initialise_model() -> Any:
     """
-    Initialise the base model and optional native-tool binding.
+    Initialise one plain ChatOllama model.
+
+    Deliberately does not call ``bind_tools``.
     """
 
     if not USE_REAL_LLM:
-        return MockLLM(), None
+        return MockLLM()
 
-    base_engine: Any = ChatOllama(
-        model=MODEL_NAME,
-        base_url=OLLAMA_BASE_URL,
-        temperature=0,
+    model_arguments: dict[str, Any] = {
+        "model": MODEL_NAME,
+        "base_url": OLLAMA_BASE_URL,
+        "temperature": MODEL_PROFILE.temperature,
+        "num_predict": MODEL_PROFILE.num_predict,
+    }
+
+    if MODEL_PROFILE.reasoning is not None:
+        model_arguments["reasoning"] = MODEL_PROFILE.reasoning
+
+    return ChatOllama(**model_arguments)
+
+base_llm: Any = initialise_model()
+
+
+# =========================================================
+# Compact Sandbox Feedback
+# =========================================================
+
+
+def _latest_tool_message(
+    state: AgentState,
+) -> ToolMessage | None:
+    """Return the most recent sandbox ToolMessage."""
+
+    messages = state.get(
+        "messages",
+        [],
     )
 
-    native_engine: Any | None = None
-
-    if SUPPORTS_NATIVE_TOOLS:
-        native_engine = base_engine.bind_tools([run_repair_attempt])
-
-    return base_engine, native_engine
-
-
-base_llm, native_llm = initialize_engines()
-
-
-# =========================================================
-# Response Normalisation
-# =========================================================
-
-
-def ensure_ai_message(
-    response: Any,
-) -> AIMessage:
-    """
-    Convert an arbitrary LangChain model response into an AIMessage.
-    """
-
-    if isinstance(response, AIMessage):
-        return response
-
-    content = getattr(
-        response,
-        "content",
-        response,
-    )
-
-    return AIMessage(content=str(content))
-
-
-# =========================================================
-# Message History Adaptation
-# =========================================================
-
-
-def sanitize_messages_for_engine(
-    messages: Sequence[BaseMessage],
-    supports_native: bool,
-) -> list[BaseMessage]:
-    """
-    Adapt graph history for the selected model interface.
-
-    Native models receive structured ToolMessage history. Text-only models
-    receive equivalent HumanMessage feedback so Ollama is not sent unsupported
-    tool protocol objects.
-    """
-
-    system_prompt = get_system_prompt(supports_native)
-
-    output_messages = list(messages)
-
-    if not output_messages or not isinstance(
-        output_messages[0],
-        SystemMessage,
-    ):
-        output_messages.insert(
-            0,
-            SystemMessage(content=system_prompt),
-        )
-    else:
-        output_messages[0] = SystemMessage(content=system_prompt)
-
-    if supports_native:
-        return output_messages
-
-    safe_messages: list[BaseMessage] = []
-
-    for message in output_messages:
-        if isinstance(message, AIMessage):
-            tool_calls = (
-                getattr(
-                    message,
-                    "tool_calls",
-                    None,
-                )
-                or []
-            )
-
-            if not tool_calls:
-                safe_messages.append(message)
-                continue
-
-            first_call = tool_calls[0]
-
-            arguments = normalise_args(
-                first_call.get(
-                    "args",
-                    {},
-                )
-            )
-
-            submitted_code = arguments.get(
-                "code",
-                "",
-            )
-
-            safe_messages.append(
-                AIMessage(
-                    content=(
-                        "Previous candidate submitted:\n"
-                        "```python\n"
-                        f"{submitted_code}\n"
-                        "```"
-                    )
-                )
-            )
-
-            continue
-
+    for message in reversed(messages):
         if isinstance(message, ToolMessage):
-            payload = parse_tool_payload(message)
-
-            if payload:
-                feedback = {
-                    "status": payload.get("status"),
-                    "message": payload.get("message"),
-                    "error": payload.get("error"),
-                    "output": payload.get("output"),
-                }
-
-                safe_messages.append(
-                    HumanMessage(
-                        content=(
-                            "SANDBOX FEEDBACK FOR THE PREVIOUS CANDIDATE:\n"
-                            f"{json.dumps(feedback, ensure_ascii=False)}\n\n"
-                            "Analyse this feedback and return a revised complete "
-                            "target.py inside one Python code block. Do not "
-                            "include framework code or the test suite."
-                        )
-                    )
-                )
-
-            else:
-                safe_messages.append(
-                    HumanMessage(
-                        content=(
-                            "SANDBOX FEEDBACK:\n"
-                            f"{message.content}\n\n"
-                            "Return a revised complete target.py inside one "
-                            "Python code block."
-                        )
-                    )
-                )
-
-            continue
-
-        safe_messages.append(message)
-
-    return safe_messages
-
-
-# =========================================================
-# Candidate Extraction
-# =========================================================
-
-
-def get_candidate_code(
-    response: AIMessage,
-) -> str | None:
-    """
-    Extract candidate source from a run_repair_attempt tool call.
-    """
-
-    tool_calls = (
-        getattr(
-            response,
-            "tool_calls",
-            None,
-        )
-        or []
-    )
-
-    for tool_call in tool_calls:
-        if not isinstance(
-            tool_call,
-            Mapping,
-        ):
-            continue
-
-        if tool_call.get("name") != "run_repair_attempt":
-            continue
-
-        arguments = tool_call.get(
-            "args",
-            {},
-        )
-
-        if not isinstance(
-            arguments,
-            Mapping,
-        ):
-            continue
-
-        candidate_code = arguments.get("code")
-
-        if isinstance(candidate_code, str) and candidate_code.strip():
-            return candidate_code
+            return message
 
     return None
 
 
-# =========================================================
-# Model Invocation
-# =========================================================
-
-
-def invoke_model(
-    messages: Sequence[BaseMessage],
-) -> tuple[AIMessage, bool]:
+def _compact_tool_feedback(
+    message: ToolMessage,
+    *,
+    maximum_characters: int,
+) -> str:
     """
-    Invoke the configured model.
+    Convert one sandbox payload into concise actionable feedback.
 
-    Returns:
-        A tuple containing:
-
-        - the AI response;
-        - whether text compatibility mode was used.
-
-    If Ollama rejects native tool calling, CLEAR falls back to ordinary text
-    completion for that response.
+    The most recent tail is retained because pytest places its short test
+    summary and final failure details near the end of the output.
     """
 
-    if native_llm is not None:
-        try:
-            native_response = native_llm.invoke(
-                sanitize_messages_for_engine(
-                    messages,
-                    True,
-                )
-            )
+    payload = parse_tool_payload(message)
 
-            return (
-                ensure_ai_message(native_response),
-                False,
-            )
+    if payload is None:
+        feedback = str(message.content)
+    else:
+        parts: list[str] = []
 
-        except Exception as exc:
-            error_text = str(exc).lower()
+        status = payload.get("status")
 
-            tool_support_error = "does not support tools" in error_text or (
-                "status code: 400" in error_text and "tool" in error_text
-            )
+        if status:
+            parts.append(f"Status: {status}")
 
-            if not tool_support_error:
-                raise
+        message_text = payload.get("message")
 
-            if os.getenv("DEBUG"):
-                print(
-                    (
-                        "Native tool calling rejected; "
-                        "falling back to text compatibility mode:"
-                    ),
-                    exc,
-                    file=sys.stderr,
-                )
+        if message_text:
+            parts.append(f"Message: {message_text}")
 
-    text_response = base_llm.invoke(
-        sanitize_messages_for_engine(
-            messages,
-            False,
+        error_text = payload.get("error")
+
+        output_text = payload.get("output")
+
+        if error_text:
+            parts.append(f"Failure details:\n{error_text}")
+
+        if output_text and output_text != error_text:
+            parts.append(f"Pytest output:\n{output_text}")
+
+        feedback = "\n\n".join(parts)
+
+    feedback = feedback.strip()
+
+    if len(feedback) <= maximum_characters:
+        return feedback
+
+    return "[Earlier traceback content omitted]\n" + feedback[-maximum_characters:]
+
+
+# =========================================================
+# Prompt Reconstruction
+# =========================================================
+
+
+def build_compact_messages(
+    state: AgentState,
+) -> list[BaseMessage]:
+    """
+    Reconstruct a compact inference context from graph state.
+
+    The full accumulated message history is deliberately not sent to Ollama.
+    """
+
+    latest_feedback = state.get("latest_feedback")
+
+    latest_tool_message = _latest_tool_message(state)
+
+    if latest_tool_message is not None:
+        latest_feedback = _compact_tool_feedback(
+            latest_tool_message,
+            maximum_characters=(MODEL_PROFILE.max_feedback_characters),
         )
+
+    user_prompt = build_compact_repair_prompt(
+        original_code=state["original_code"],
+        test_suite=state["test_suite"],
+        latest_candidate=state.get("latest_candidate"),
+        latest_feedback=latest_feedback,
     )
 
-    return (
-        ensure_ai_message(text_response),
-        True,
+    return [
+        SystemMessage(content=CODE_ONLY_SYSTEM_PROMPT),
+        HumanMessage(content=user_prompt),
+    ]
+
+
+# =========================================================
+# Inference
+# =========================================================
+
+def invoke_model(
+    state: AgentState,
+) -> AIMessage:
+    """
+    Invoke the selected model through the shared code-only protocol.
+
+    Response telemetry is recorded before and after model-specific
+    normalisation. Terminal response failures are attached to the returned
+    message so the repair graph can stop rather than issuing identical,
+    expensive retries.
+    """
+
+    messages = build_compact_messages(state)
+    raw_response = base_llm.invoke(messages)
+
+    if isinstance(raw_response, AIMessage):
+        response = raw_response
+    else:
+        response = AIMessage(
+            content=str(
+                getattr(
+                    raw_response,
+                    "content",
+                    raw_response,
+                )
+            )
+        )
+
+    raw_content = str(response.content or "")
+
+    response_metadata = (
+        getattr(
+            response,
+            "response_metadata",
+            {},
+        )
+        or {}
+    )
+
+    additional_kwargs = (
+        getattr(
+            response,
+            "additional_kwargs",
+            {},
+        )
+        or {}
+    )
+
+    reasoning_content = str(
+        additional_kwargs.get(
+            "reasoning_content",
+            "",
+        )
+        or ""
+    )
+
+    cleaned_content = raw_content
+
+    if MODEL_PROFILE.strip_reasoning:
+        cleaned_content = strip_reasoning_blocks(cleaned_content)
+
+    cleaned_content = cleaned_content.strip()
+
+    done_reason = str(
+        response_metadata.get(
+            "done_reason",
+            "",
+        )
+        or ""
+    )
+
+    evaluation_count = response_metadata.get("eval_count")
+
+    prompt_evaluation_count = response_metadata.get("prompt_eval_count")
+
+    logger.info(
+        (
+            "Model response telemetry | Model=%s | "
+            "RawChars=%d | CleanedChars=%d | "
+            "ReasoningChars=%d | DoneReason=%s | "
+            "EvalCount=%s | PromptEvalCount=%s"
+        ),
+        MODEL_PROFILE.name,
+        len(raw_content),
+        len(cleaned_content),
+        len(reasoning_content),
+        done_reason or "unknown",
+        evaluation_count,
+        prompt_evaluation_count,
+    )
+    
+    failure_reason: str | None = None
+
+    if not cleaned_content and done_reason == "length":
+        failure_reason = (
+            "Model generation limit exhausted before final repair payload"
+        )
+
+        logger.warning(
+            "%s | Model=%s | NumPredict=%d | ReasoningChars=%d",
+            failure_reason,
+            MODEL_PROFILE.name,
+            MODEL_PROFILE.num_predict,
+            len(reasoning_content),
+        )
+
+    elif raw_content.strip() and not cleaned_content:
+        failure_reason = (
+            "Model response became empty after protocol normalisation"
+        )
+
+        logger.warning(
+            "%s | Model=%s | RawChars=%d | ReasoningChars=%d",
+            failure_reason,
+            MODEL_PROFILE.name,
+            len(raw_content),
+            len(reasoning_content),
+        )
+
+        logger.debug(
+            "Raw response removed during normalisation:\n%s",
+            raw_content,
+        )
+
+    elif not cleaned_content:
+        failure_reason = (
+            "Model returned no executable final response content"
+        )
+
+        logger.warning(
+            "%s | Model=%s | ReasoningChars=%d | DoneReason=%s",
+            failure_reason,
+            MODEL_PROFILE.name,
+            len(reasoning_content),
+            done_reason or "unknown",
+        )
+
+    message_metadata: dict[str, Any] = {
+        "done_reason": done_reason,
+        "eval_count": evaluation_count,
+        "prompt_eval_count": prompt_evaluation_count,
+        "reasoning_characters": len(reasoning_content),
+    }
+
+    if failure_reason is not None:
+        message_metadata["clear_failure_reason"] = failure_reason
+
+    return AIMessage(
+        content=cleaned_content,
+        additional_kwargs=message_metadata,
+        response_metadata=response_metadata,
     )

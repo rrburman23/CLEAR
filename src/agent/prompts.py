@@ -1,70 +1,69 @@
-# src/agent/prompts.py
 """
-CLEAR Agent Prompt Engineering
+CLEAR Code-Only Repair Prompts
 
-Maintains the system-level instructions governing LLM behavior. 
-Separating these prompts allows for rapid experimentation and prompt-tuning 
-without modifying the underlying execution mechanisms.
+Every model in the principal experiment receives the same output protocol.
+The model produces source code only; CLEAR constructs and executes tool calls.
 """
 
-# -----------------------------------------------------------------------------
-# Native Tool Prompt
-# -----------------------------------------------------------------------------
-# Deployed exclusively for architectures capable of strict schema adherence 
-# (e.g., Llama 3.1, Gemma 2, Granite-Code).
-NATIVE_SYSTEM_PROMPT = """
-You are CLEAR, an autonomous Python software repair agent.
+from __future__ import annotations
 
-You have exactly one tool:
 
-run_repair_attempt(
-    code: str,
-    test_suite: str
-)
+CODE_ONLY_SYSTEM_PROMPT = """
+You are CLEAR, an autonomous Python software-repair model.
 
-Rules:
+Your task is to repair the supplied target.py implementation so that it passes
+the supplied pytest verification suite.
 
-1. Analyse the supplied broken target.py.
-2. Call run_repair_attempt with the complete repaired source.
-3. Pass the validation test suite through unchanged.
-4. Never weaken, remove, modify, replace or bypass tests.
-5. If verification fails, inspect the feedback and submit revised code.
-6. Stop when the tool returns status SUCCESS.
+OUTPUT CONTRACT:
 
-The framework automatically saves the exact successful candidate.
-Do not repeat the code after successful verification.
-"""
+- Return the complete standalone target.py source.
+- Return exactly one Python Markdown code block.
+- Do not return JSON.
+- Do not generate a tool call.
+- Do not include explanations before or after the code.
+- Do not include the test suite in the repaired source.
+- Do not import CLEAR, LangGraph, LangChain, or run_repair_attempt.
+- Preserve the intended public functions, classes, and method names.
+- Use the latest sandbox failure to improve the previous candidate.
+""".strip()
 
-# -----------------------------------------------------------------------------
-# Text-Compatibility Prompt
-# -----------------------------------------------------------------------------
-# Deployed for architectures prone to schema collapse or those lacking 
-# native function-calling APIs (e.g., Qwen 2.5 3B, Phi-3 Mini).
-TEXT_SYSTEM_PROMPT = """
-You are CLEAR, an autonomous Python software repair agent.
 
-The model interface you are using does not provide native function calling.
+def build_compact_repair_prompt(
+    *,
+    original_code: str,
+    test_suite: str,
+    latest_candidate: str | None,
+    latest_feedback: str | None,
+) -> str:
+    """
+    Construct one compact, self-contained model prompt.
 
-Your job is to return a complete repaired target.py implementation.
+    Only the canonical task, latest candidate, and latest sandbox feedback are
+    included. Earlier candidates and complete historical tracebacks are not
+    sent back to the model.
+    """
 
-OUTPUT RULES:
+    sections = [
+        ("REPAIR TASK\n\nRepair the following complete target.py implementation."),
+        (f"ORIGINAL TARGET.PY\n```python\n{original_code.rstrip()}\n```"),
+        (f"PYTEST VERIFICATION SUITE\n```python\n{test_suite.rstrip()}\n```"),
+    ]
 
-1. Return only the complete repaired Python source.
-2. Put the source inside one Python Markdown code block.
-3. Do not include explanations before or after the code block.
-4. Do not include the validation tests in the output.
-5. Do not weaken, modify, replace or bypass any test.
-6. When sandbox feedback is provided, return a revised complete program.
+    if latest_candidate:
+        sections.append(
+            "LATEST CANDIDATE\n"
+            "The following candidate was most recently submitted:\n"
+            "```python\n"
+            f"{latest_candidate.rstrip()}\n"
+            "```"
+        )
 
-Required format:
+    if latest_feedback:
+        sections.append(f"LATEST VERIFICATION FEEDBACK\n{latest_feedback.rstrip()}")
 
-```python
-# complete target.py source
-```
-The CLEAR framework will automatically convert your code response into a
-run_repair_attempt tool call and execute it in Docker.
-"""
+    sections.append(
+        "Return one improved, complete target.py inside exactly one "
+        "Python Markdown code block."
+    )
 
-def get_system_prompt(supports_native_tools: bool) -> str:
-    """Dynamically resolves the optimal constraint environment."""
-    return NATIVE_SYSTEM_PROMPT if supports_native_tools else TEXT_SYSTEM_PROMPT
+    return "\n\n".join(sections)

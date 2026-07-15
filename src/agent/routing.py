@@ -77,3 +77,31 @@ def route_after_tools(
         return "end"
 
     return "agent"
+
+
+def get_model_failure_reason(
+    state: AgentState,
+) -> str | None:
+    """
+    Return a terminal failure reported by the model adapter.
+
+    The adapter uses this metadata when the model exhausts its generation
+    budget or returns no executable final response.
+    """
+
+    messages = state.get("messages", [])
+
+    if not messages:
+        return None
+
+    latest_message = messages[-1]
+
+    if not isinstance(latest_message, AIMessage):
+        return None
+
+    failure_reason = latest_message.additional_kwargs.get("clear_failure_reason")
+
+    if not failure_reason:
+        return None
+
+    return str(failure_reason)

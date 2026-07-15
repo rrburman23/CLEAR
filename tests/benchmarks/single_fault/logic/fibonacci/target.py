@@ -1,8 +1,11 @@
 def fibonacci(n: int) -> int:
     """
-    Returns the n-th Fibonacci number.
-    
+    Return the n-th Fibonacci number.
     """
+
+    if n < 0:
+        raise ValueError("n must be non-negative")
+
     if n <= 1:
         return n
 
@@ -10,7 +13,6 @@ def fibonacci(n: int) -> int:
     b = 1
 
     for _ in range(2, n + 1):
-        
         a, b = b, a + a
 
     return b

@@ -10,35 +10,17 @@ from typing import Annotated, Sequence
 
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
-from typing_extensions import NotRequired, TypedDict
+from typing_extensions import TypedDict
 
 
 class AgentState(TypedDict):
     """
-    State for one autonomous repair execution.
+    State for one autonomous repair operation.
 
-    Attributes:
-        messages:
-            LangChain conversation history. LangGraph appends new messages
-            using the add_messages reducer.
-
-        test_suite:
-            Canonical test suite supplied by src.main. The model is never
-            trusted to reproduce or modify this value.
-
-        invalid_responses:
-            Number of consecutive responses that could not be converted into
-            an executable repair candidate.
-
-        last_candidate_hash:
-            Stable hash of the most recently generated candidate.
-
-        repeated_candidate_count:
-            Number of consecutive times the current candidate has appeared.
-
-        terminal_failure:
-            Framework-generated terminal failure reason. When populated, the
-            routing layer ends the graph without another sandbox execution.
+    The complete message history remains available for auditing, but the model
+    adapter reconstructs a compact prompt for each inference request rather
+    than sending the entire history back to the model.
+    
     """
 
     messages: Annotated[
@@ -46,12 +28,21 @@ class AgentState(TypedDict):
         add_messages,
     ]
 
+    # Canonical task inputs.
+    original_code: str
     test_suite: str
 
-    invalid_responses: NotRequired[int]
+    # Latest generated candidate and retry feedback.
+    latest_candidate: str | None
+    latest_feedback: str | None
 
-    last_candidate_hash: NotRequired[str | None]
-
-    repeated_candidate_count: NotRequired[int]
-
-    terminal_failure: NotRequired[str | None]
+    # Protocol-failure tracking.
+    invalid_responses: int
+    failure_reason: str | None
+    terminal_failure: str | None
+    verified: bool | None
+    
+    # Candidate-stagnation tracking.
+    last_candidate_hash: str | None
+    repeated_candidate_count: int
+    candidate_hashes: list[str]

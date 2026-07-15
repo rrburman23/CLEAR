@@ -137,7 +137,7 @@ def _kpi_block(summary_by_model: list[dict[str, Any]]) -> str:
     ]
     if best_ttr:
         lines.append(
-            f"- Fastest mean **TTR**: `{best_ttr.get('model', 'N/A')}` ({best_ttr.get('mean_ttr_s', 0):.2f} s)"
+            f"- Fastest mean successful-repair **TTR**: `{best_ttr.get('model', 'N/A')}` ({best_ttr.get('mean_ttr_s', 0):.2f} s)"
         )
     return "\n".join(lines)
 

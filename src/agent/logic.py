@@ -1,29 +1,23 @@
 """
-CLEAR Central Orchestrator
+CLEAR Central Repair Orchestrator
 
-Composes the repair-agent modules into a compiled LangGraph application.
-
-This module defines the model node and graph structure. External callers need
-only import clear_agent from this module.
+Composes the code-only model adapter, internal tool-call conversion, sandbox
+tool node, candidate tracking, and termination routing.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import ToolNode
 
 from src.agent.candidate import (
     build_candidate_tracking_update,
     convert_text_response_to_tool_call,
-    normalise_args,
-)
-from src.agent.model_adapter import (
     get_candidate_code,
-    invoke_model,
 )
+from src.agent.model_adapter import invoke_model
 from src.agent.routing import (
     route_after_agent,
     route_after_tools,
@@ -31,10 +25,6 @@ from src.agent.routing import (
 from src.agent.state import AgentState
 from src.tools.agent_tools import run_repair_attempt
 
-
-# =========================================================
-# Configuration
-# =========================================================
 
 MAX_INVALID_RESPONSES = 3
 
@@ -45,147 +35,59 @@ TOOLS = [
 tool_node = ToolNode(TOOLS)
 
 
-# =========================================================
-# State Update Helpers
-# =========================================================
-
-
-def build_valid_candidate_update(
-    *,
-    state: AgentState,
-    response: AIMessage,
-) -> dict[str, Any]:
-    """
-    Build a graph state update for an executable repair candidate.
-
-    Candidate tracking occurs only after the response has been converted into
-    the exact tool call that will be routed to the sandbox.
-    """
-
-    state_update: dict[str, Any] = {
-        "messages": [response],
-        "invalid_responses": 0,
-        "terminal_failure": None,
-    }
-
-    candidate_code = get_candidate_code(response)
-
-    if candidate_code is not None:
-        state_update.update(
-            build_candidate_tracking_update(
-                state=state,
-                candidate_code=candidate_code,
-            )
-        )
-
-    return state_update
-
-
-# =========================================================
-# Agent Node
-# =========================================================
-
-
 def call_model(
     state: AgentState,
 ) -> dict[str, Any]:
     """
-    Generate one candidate repair.
+    Generate one candidate and convert it into an internal sandbox tool call.
 
-    Processing order:
+    The selected model produces source code only. CLEAR creates the actual
+    ``run_repair_attempt`` call with the canonical test suite.
 
-    1. Invoke the configured model.
-    2. Accept and normalise a native tool call where available.
-    3. Otherwise convert text output into a synthetic tool call.
-    4. Track the resulting executable candidate.
-    5. Request corrected formatting after invalid responses.
+    Model-adapter failures are copied directly into graph state so terminal
+    generation failures stop immediately without additional model calls.
     """
 
-    response, used_text_mode = invoke_model(state["messages"])
+    response = invoke_model(state)
 
-    canonical_test_suite = state["test_suite"]
+    model_failure_reason = response.additional_kwargs.get("clear_failure_reason")
 
-    tool_calls = (
-        getattr(
-            response,
-            "tool_calls",
-            None,
-        )
-        or []
-    )
+    if model_failure_reason:
+        failure_reason = str(model_failure_reason)
 
-    # =====================================================
-    # Path A: Valid native tool call
-    # =====================================================
-
-    if tool_calls and not used_text_mode:
-        normalised_calls: list[dict[str, Any]] = []
-
-        for index, tool_call in enumerate(
-            tool_calls,
-            start=1,
-        ):
-            arguments = normalise_args(
-                tool_call.get(
-                    "args",
-                    {},
-                )
-            )
-
-            candidate_code = arguments.get(
-                "code",
-                "",
-            )
-
-            if not candidate_code.strip():
-                continue
-
-            normalised_calls.append(
-                {
-                    "name": "run_repair_attempt",
-                    "args": {
-                        "code": candidate_code,
-                        "test_suite": canonical_test_suite,
-                    },
-                    "id": tool_call.get(
-                        "id",
-                        f"clear-native-call-{index}",
-                    ),
-                }
-            )
-
-            # One candidate is evaluated per graph iteration.
-            break
-
-        if normalised_calls:
-            normalised_response = AIMessage(
-                content=response.content,
-                tool_calls=normalised_calls,
-            )
-
-            return build_valid_candidate_update(
-                state=state,
-                response=normalised_response,
-            )
-
-    # =====================================================
-    # Path B: Text compatibility conversion
-    # =====================================================
+        return {
+            "messages": [response],
+            "terminal_failure": failure_reason,
+            "failure_reason": failure_reason,
+            "verified": False,
+        }
 
     converted_response = convert_text_response_to_tool_call(
         response_text=str(response.content),
-        canonical_test_suite=canonical_test_suite,
+        canonical_test_suite=state["test_suite"],
     )
 
     if converted_response is not None:
-        return build_valid_candidate_update(
-            state=state,
-            response=converted_response,
-        )
+        candidate_code = get_candidate_code(converted_response)
 
-    # =====================================================
-    # Path C: Invalid model protocol response
-    # =====================================================
+        if candidate_code is not None:
+            state_update: dict[str, Any] = {
+                "messages": [converted_response],
+                "latest_candidate": candidate_code,
+                "latest_feedback": None,
+                "invalid_responses": 0,
+                "terminal_failure": None,
+                "failure_reason": None,
+            }
+
+            tracking_update = build_candidate_tracking_update(
+                state=state,
+                candidate_code=candidate_code,
+            )
+
+            state_update.update(tracking_update)
+
+            return state_update
 
     invalid_responses = (
         state.get(
@@ -195,38 +97,41 @@ def call_model(
         + 1
     )
 
-    if invalid_responses >= MAX_INVALID_RESPONSES:
-        return {
-            "messages": [response],
-            "invalid_responses": invalid_responses,
-            "terminal_failure": (
-                "Model protocol failure: no executable repair payload "
-                f"after {invalid_responses} responses"
-            ),
-        }
-
-    feedback = HumanMessage(
-        content=(
-            "Your response could not be converted into a repair attempt. "
-            "Return only the complete repaired target.py inside one Python "
-            "Markdown code block. Do not include explanations, the test "
-            "suite, or CLEAR framework code."
-        )
+    protocol_feedback = (
+        "The previous response could not be parsed as a complete valid "
+        "Python program. Return exactly one Python Markdown code block "
+        "containing the complete standalone target.py source. Do not "
+        "include prose, JSON, tool calls, tests, or framework code."
     )
 
+    if invalid_responses >= MAX_INVALID_RESPONSES:
+        failure_reason = (
+            "Model protocol failure: no executable repair payload "
+            f"after {invalid_responses} responses"
+        )
+
+        return {
+            "messages": [response],
+            "latest_feedback": protocol_feedback,
+            "invalid_responses": invalid_responses,
+            "terminal_failure": failure_reason,
+            "failure_reason": failure_reason,
+            "verified": False,
+        }
+
     return {
-        "messages": [
-            response,
-            feedback,
-        ],
+        "messages": [response],
+        "latest_feedback": protocol_feedback,
         "invalid_responses": invalid_responses,
         "terminal_failure": None,
+        "failure_reason": None,
     }
 
 
 # =========================================================
-# Graph Compilation
+# Graph Construction
 # =========================================================
+
 
 workflow = StateGraph(AgentState)
 
@@ -261,6 +166,4 @@ workflow.add_conditional_edges(
     },
 )
 
-
-# Public compiled graph used by src.main.
 clear_agent = workflow.compile()

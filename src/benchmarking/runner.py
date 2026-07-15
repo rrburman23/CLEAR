@@ -26,6 +26,11 @@ from src.benchmarking.models import (
     BenchmarkTask,
     ExperimentSettings,
 )
+
+from src.benchmarking.validation import (
+    BenchmarkInfrastructureError,
+    verify_test_collection,
+)
 from src.reporting.exporter import export_experiment
 from src.utils.terminal import failure, info, success, warning
 

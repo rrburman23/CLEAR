@@ -371,7 +371,7 @@ def plot_cumulative_success_by_iteration(
         )
 
     axis.set_title(
-        "Search Trajectory Optimization: Cumulative Success Rate (Pass@k Curve)",
+        "Search Trajectory Optimization: Cumulative Success Rate by Iteration,)",
         fontsize=12,
         fontweight="bold",
         pad=15,
