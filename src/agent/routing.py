@@ -53,24 +53,32 @@ def route_after_tools(
     state: AgentState,
 ) -> str:
     """
-    End after verified sandbox success or return failure feedback to the model.
+    Route after sandbox execution.
+
+    - Verified candidates terminate successfully.
+    - Infrastructure errors terminate without further model calls.
+    - Ordinary test failures return feedback to the model.
     """
 
     last_message = state["messages"][-1]
 
-    if not isinstance(
-        last_message,
-        ToolMessage,
-    ):
+    if not isinstance(last_message, ToolMessage):
         return "agent"
 
     payload = parse_tool_payload(last_message)
 
-    candidate_code = payload.get("code") if payload else None
+    if not payload:
+        return "agent"
+
+    status = payload.get("status")
+
+    if status == "INFRASTRUCTURE_ERROR":
+        return "infrastructure_error"
+
+    candidate_code = payload.get("code")
 
     if (
-        payload
-        and payload.get("status") == "SUCCESS"
+        status == "SUCCESS"
         and isinstance(candidate_code, str)
         and candidate_code.strip()
     ):

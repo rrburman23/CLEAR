@@ -1,93 +1,110 @@
-
 """
 CLEAR Benchmark Validation
 
-Performs benchmark infrastructure checks before model evaluation.
+Performs benchmark-infrastructure checks before model evaluation.
+
+The test suite is validated statically because importing it during pytest
+collection may also import the intentionally faulty target.py. Syntax-error
+benchmarks are therefore expected to fail ordinary pytest collection before
+repair.
 """
 
 from __future__ import annotations
 
-import subprocess
-import sys
+import ast
 from pathlib import Path
 
 
-PYTEST_SUCCESS = 0
-PYTEST_NO_TESTS_COLLECTED = 5
-
-
 class BenchmarkInfrastructureError(RuntimeError):
-    """Raised when a benchmark cannot be executed reliably."""
+    """Raised when a benchmark definition is invalid."""
+
+
+def _count_test_functions(tree: ast.AST) -> int:
+    """
+    Count pytest-discoverable functions and methods.
+
+    Pytest discovers module-level functions and class methods whose names
+    begin with ``test_``.
+    """
+
+    count = 0
+
+    for node in ast.walk(tree):
+        if isinstance(
+            node,
+            (
+                ast.FunctionDef,
+                ast.AsyncFunctionDef,
+            ),
+        ) and node.name.startswith("test_"):
+            count += 1
+
+    return count
 
 
 def verify_test_collection(
     test_file: Path,
 ) -> int:
     """
-    Ensure pytest can collect at least one test.
+    Validate that a benchmark test file contains at least one test.
 
-    Returns:
-        Number of collected tests when it can be extracted from pytest output.
+    This check deliberately does not invoke ``pytest --collect-only`` because
+    benchmark test files import an intentionally faulty target.py. For syntax
+    benchmarks, importing that target necessarily raises SyntaxError or
+    IndentationError before pytest can complete collection.
 
-    Raises:
-        BenchmarkInfrastructureError:
-            If the file does not exist, pytest collects no tests, or collection
-            fails because of an import or syntax error.
+    Returns
+    -------
+    int
+        Number of statically discovered test functions.
+
+    Raises
+    ------
+    BenchmarkInfrastructureError
+        If the test file is missing, unreadable, syntactically invalid, or
+        contains no pytest-discoverable tests.
     """
 
-    resolved_test_file = test_file.resolve()
+    test_file = test_file.resolve()
 
-    if not resolved_test_file.is_file():
+    if not test_file.is_file():
         raise BenchmarkInfrastructureError(
-            f"Benchmark test suite does not exist: {resolved_test_file}"
+            f"Benchmark test file does not exist.\nTest file: {test_file}"
         )
 
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            "--collect-only",
-            "-q",
-            str(resolved_test_file),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    combined_output = "\n".join(
-        part
-        for part in (
-            result.stdout.strip(),
-            result.stderr.strip(),
-        )
-        if part
-    )
-
-    if result.returncode == PYTEST_NO_TESTS_COLLECTED:
+    try:
+        source = test_file.read_text(encoding="utf-8")
+    except OSError as exc:
         raise BenchmarkInfrastructureError(
-            "Pytest collected no tests.\n"
-            f"Test file: {resolved_test_file}\n"
-            f"Exit code: {result.returncode}\n"
-            f"Output:\n{combined_output}"
-        )
+            "Benchmark test file could not be read.\n"
+            f"Test file: {test_file}\n"
+            f"Error: {exc}"
+        ) from exc
 
-    if result.returncode != PYTEST_SUCCESS:
+    if not source.strip():
         raise BenchmarkInfrastructureError(
-            "Benchmark test collection failed.\n"
-            f"Test file: {resolved_test_file}\n"
-            f"Exit code: {result.returncode}\n"
-            f"Output:\n{combined_output}"
+            f"Benchmark test file is empty.\nTest file: {test_file}"
         )
 
-    collected_tests = sum(1 for line in result.stdout.splitlines() if "::test_" in line)
+    try:
+        syntax_tree = ast.parse(
+            source,
+            filename=str(test_file),
+        )
+    except SyntaxError as exc:
+        raise BenchmarkInfrastructureError(
+            "Benchmark test suite contains invalid Python syntax.\n"
+            f"Test file: {test_file}\n"
+            f"Line: {exc.lineno}\n"
+            f"Error: {exc.msg}"
+        ) from exc
+
+    collected_tests = _count_test_functions(syntax_tree)
 
     if collected_tests == 0:
         raise BenchmarkInfrastructureError(
-            "Pytest returned success but no test cases were identified.\n"
-            f"Test file: {resolved_test_file}\n"
-            f"Output:\n{combined_output}"
+            "Benchmark test suite defines no pytest-discoverable tests.\n"
+            f"Test file: {test_file}"
         )
 
     return collected_tests

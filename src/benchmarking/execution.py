@@ -17,6 +17,11 @@ from src.benchmarking.failures import (
     normalise_timeout_output,
 )
 from src.benchmarking.models import BenchmarkResult, BenchmarkTask
+from src.benchmarking.validation import (
+    BenchmarkInfrastructureError,
+    verify_test_collection,
+)
+
 from src.utils.diff import generate_patch
 
 
@@ -172,9 +177,30 @@ def execute_benchmark(
     A verified repair is captured before restoration so the reporting layer
     can export the repaired source and unified diff.
     """
-
     target_path = Path(task.target_file)
+    test_path = Path(task.test_file)
     benchmark_id = task.benchmark_id
+
+    # Validate the human-authored pytest oracle before launching Ollama.
+    # A broken or empty test suite is an experiment infrastructure problem,
+    # not evidence that the evaluated model failed to repair the program.
+    try:
+        collected_tests = verify_test_collection(test_path)
+
+    except BenchmarkInfrastructureError as exc:
+        raise BenchmarkInfrastructureError(
+            f"{benchmark_id}: {exc}"
+        ) from exc
+
+    logging.info(
+        (
+            "Benchmark collection verified | Benchmark=%s | "
+            "TestFile=%s | CollectedTests=%d"
+        ),
+        benchmark_id,
+        test_path,
+        collected_tests,
+    )
 
     original_code = target_path.read_text(encoding="utf-8")
 
@@ -183,10 +209,10 @@ def execute_benchmark(
         "-m",
         "src.main",
         "--code",
-        task.target_file,
+        str(target_path),
         "--test",
-        task.test_file,
-    ]
+        str(test_path),
+]
 
     process_returncode: int | None = None
 
@@ -223,6 +249,28 @@ def execute_benchmark(
 
         clear_result = extract_clear_result(stdout)
 
+        if clear_result is not None:
+            child_status = str(
+                clear_result.get(
+                    "status",
+                    "",
+                )
+            ).upper()
+
+            if child_status == "INFRASTRUCTURE_ERROR":
+                infrastructure_reason = str(
+                    clear_result.get("reason")
+                    or clear_result.get("message")
+                    or (
+                        "The benchmark child process reported an "
+                        "infrastructure error."
+                    )
+                )
+
+                raise BenchmarkInfrastructureError(
+                    f"{benchmark_id}: {infrastructure_reason}"
+                )
+
         provisional_success = bool(
             clear_result
             and str(
@@ -247,7 +295,6 @@ def execute_benchmark(
         timed_out = True
 
         stdout = normalise_timeout_output(exc.stdout)
-
         stderr = normalise_timeout_output(exc.stderr)
 
         logging.error(
@@ -255,6 +302,11 @@ def execute_benchmark(
             benchmark_id,
             timeout_seconds,
         )
+
+    except BenchmarkInfrastructureError:
+        # Propagate infrastructure errors to the experiment runner.
+        # The finally block still restores the benchmark target.
+        raise
 
     except Exception as exc:
         stderr = f"{type(exc).__name__}: {exc}"

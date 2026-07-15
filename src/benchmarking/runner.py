@@ -6,6 +6,7 @@ import logging
 import re
 import subprocess
 import time
+import json
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -51,9 +52,7 @@ def create_run_directory(
     """Create and return the isolated output directory for one experiment."""
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    model_component = "_".join(
-        make_filename_safe(model) for model in settings.models
-    )
+    model_component = "_".join(make_filename_safe(model) for model in settings.models)
 
     # Avoid Windows MAX_PATH problems during full multi-model experiments.
     if len(model_component) > 80:
@@ -220,8 +219,7 @@ def display_final_reports(results: list[BenchmarkResult]) -> None:
         "MODEL PERFORMANCE BY DIFFICULTY",
         summarise_by_model_difficulty(results),
         lambda row: (
-            f"{row['model']} / T{row['difficulty_tier']} "
-            f"{row['difficulty_label']}"
+            f"{row['model']} / T{row['difficulty_tier']} {row['difficulty_label']}"
         ),
     )
 
@@ -269,11 +267,7 @@ def log_breakdown_statistics(results: list[BenchmarkResult]) -> None:
             row["successes"],
             row["success_rate_pct"],
             row["pass_at_1_pct"],
-            (
-                f"{row['mean_ttr_s']:.3f}s"
-                if row["mean_ttr_s"] is not None
-                else "N/A"
-            ),
+            (f"{row['mean_ttr_s']:.3f}s" if row["mean_ttr_s"] is not None else "N/A"),
             (
                 f"{row['iteration_efficiency']:.3f}"
                 if row["iteration_efficiency"] is not None
@@ -354,6 +348,78 @@ def _display_discovery_summary(tasks: list[BenchmarkTask]) -> None:
             info(f"  {difficulty.code} {difficulty.label}: {count}")
 
 
+def validate_discovered_benchmarks(
+    *,
+    tasks: list[BenchmarkTask],
+    run_directory: Path,
+) -> None:
+    """
+    Validate every discovered benchmark before any model is invoked.
+
+    The experiment aborts when one or more benchmark suites are invalid.
+    This prevents incomplete or unbalanced model comparisons.
+    """
+
+    infrastructure_errors: list[dict[str, Any]] = []
+
+    for task in tasks:
+        try:
+            collected_tests = verify_test_collection(
+                Path(task.test_file),
+            )
+        except BenchmarkInfrastructureError as exc:
+            infrastructure_errors.append(
+                {
+                    "benchmark_id": task.benchmark_id,
+                    "difficulty": task.difficulty.name,
+                    "category": task.category,
+                    "benchmark": task.benchmark,
+                    "test_path": str(Path(task.test_file)),
+                    "reason": str(exc),
+                }
+            )
+
+            logging.error(
+                (
+                    "Benchmark validation failed | Benchmark=%s | "
+                    "TestPath=%s | Reason=%s"
+                ),
+                task.benchmark_id,
+                Path(task.test_file),
+                exc,
+            )
+
+            continue
+
+        logging.info(
+            ("Benchmark validation passed | Benchmark=%s | CollectedTests=%d"),
+            task.benchmark_id,
+            collected_tests,
+        )
+
+    if not infrastructure_errors:
+        success(f"Validated {len(tasks)} benchmark test suites.")
+        return
+
+    output_path = run_directory / "infrastructure_errors.json"
+
+    output_path.write_text(
+        json.dumps(
+            infrastructure_errors,
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    failure(
+        f"{len(infrastructure_errors)} benchmark infrastructure error(s) were detected."
+    )
+    failure(f"Diagnostics saved to: {output_path}")
+
+    raise SystemExit(3)
+
+
 def run_experiment(settings: ExperimentSettings) -> Path:
     """Execute the complete sequential benchmark experiment.
 
@@ -390,8 +456,14 @@ def run_experiment(settings: ExperimentSettings) -> Path:
         failure("No matching benchmark tasks were discovered.")
         raise SystemExit(1)
 
+
     _display_discovery_summary(tasks)
 
+    validate_discovered_benchmarks(
+        tasks=tasks,
+        run_directory=run_directory,
+    )
+    
     results: list[BenchmarkResult] = []
     catastrophic_errors = 0
 
@@ -420,12 +492,70 @@ def run_experiment(settings: ExperimentSettings) -> Path:
                     timeout_seconds=settings.timeout_seconds,
                     max_iterations=settings.max_iterations,
                 )
+                
+            except BenchmarkInfrastructureError as exc:
+                logging.error(
+                    (
+                        "Runtime benchmark infrastructure error | "
+                        "Model=%s | Benchmark=%s | Reason=%s"
+                    ),
+                    model,
+                    task.benchmark_id,
+                    exc,
+                )
+
+                infrastructure_output = (
+                    run_directory / "runtime_infrastructure_error.json"
+                )
+
+                infrastructure_payload = {
+                    "status": "INFRASTRUCTURE_ERROR",
+                    "model": model,
+                    "benchmark_id": task.benchmark_id,
+                    "difficulty": task.difficulty.name,
+                    "difficulty_tier": task.difficulty.tier,
+                    "category": task.category,
+                    "benchmark": task.benchmark,
+                    "test_file": task.test_file,
+                    "reason": str(exc),
+                }
+
+                infrastructure_output.write_text(
+                    json.dumps(
+                        infrastructure_payload,
+                        indent=2,
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+
+                failure(
+                    "The experiment stopped because benchmark infrastructure failed."
+                )
+                failure(f"Benchmark: {task.benchmark_id}")
+                failure(f"Reason: {exc}")
+                failure(f"Diagnostics saved to: {infrastructure_output}")
+
+                # Export only completed model-repair results. The
+                # infrastructure error is deliberately not appended to
+                # results and therefore cannot affect SR, FR, P@1 or TTR.
+                if results:
+                    export_experiment(
+                        results,
+                        run_directory,
+                        settings,
+                    )
+
+                raise SystemExit(3) from exc
+
             except Exception as exc:
                 catastrophic_errors += 1
+
                 logging.exception(
                     "Catastrophic runner error for %s.",
                     task.benchmark_id,
                 )
+
                 result = _catastrophic_result(
                     model=model,
                     task=task,
@@ -435,7 +565,11 @@ def run_experiment(settings: ExperimentSettings) -> Path:
                 if settings.stop_on_error:
                     results.append(result)
                     display_benchmark_result(result)
-                    export_experiment(results, run_directory, settings)
+                    export_experiment(
+                        results,
+                        run_directory,
+                        settings,
+                    )
                     raise
 
             results.append(result)

@@ -1,6 +1,5 @@
 import pandas as pd
 import glob
-import os
 
 # 1. Use an explicit glob pattern that captures the nested structure
 # This pattern matches any folder inside logs that starts with 'run_'

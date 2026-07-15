@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from langchain_core.messages import ToolMessage
 from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import ToolNode
 
@@ -16,6 +17,7 @@ from src.agent.candidate import (
     build_candidate_tracking_update,
     convert_text_response_to_tool_call,
     get_candidate_code,
+    parse_tool_payload,
 )
 from src.agent.model_adapter import invoke_model
 from src.agent.routing import (
@@ -23,7 +25,7 @@ from src.agent.routing import (
     route_after_tools,
 )
 from src.agent.state import AgentState
-from src.tools.agent_tools import run_repair_attempt
+from src.tools.repair_tools import run_repair_attempt
 
 
 MAX_INVALID_RESPONSES = 3
@@ -34,7 +36,53 @@ TOOLS = [
 
 tool_node = ToolNode(TOOLS)
 
+def record_infrastructure_error(
+    state: AgentState,
+) -> dict[str, Any]:
+    """
+    Copy a sandbox infrastructure error into graph state.
 
+    This prevents CLEAR from asking the model to repair a broken benchmark
+    configuration.
+    """
+
+    messages = state.get("messages", [])
+
+    if not messages:
+        reason = "Unknown benchmark infrastructure failure."
+
+        return {
+            "terminal_failure": reason,
+            "failure_reason": reason,
+            "verified": False,
+        }
+
+    latest_message = messages[-1]
+
+    if not isinstance(latest_message, ToolMessage):
+        reason = "Expected an infrastructure ToolMessage but none was found."
+
+        return {
+            "terminal_failure": reason,
+            "failure_reason": reason,
+            "verified": False,
+        }
+
+    payload = parse_tool_payload(latest_message) or {}
+
+    reason = str(
+        payload.get("message")
+        or payload.get("error")
+        or "Benchmark infrastructure failure."
+    )
+
+    return {
+        "terminal_failure": reason,
+        "failure_reason": reason,
+        "verified": False,
+    }
+    
+    
 def call_model(
     state: AgentState,
 ) -> dict[str, Any]:
@@ -136,6 +184,15 @@ def call_model(
 workflow = StateGraph(AgentState)
 
 workflow.add_node(
+    "infrastructure_error",
+    record_infrastructure_error,
+)
+
+workflow.add_edge(
+    "infrastructure_error",
+    END,
+)
+workflow.add_node(
     "agent",
     call_model,
 )
@@ -162,6 +219,7 @@ workflow.add_conditional_edges(
     route_after_tools,
     {
         "agent": "agent",
+        "infrastructure_error": "infrastructure_error",
         "end": END,
     },
 )
