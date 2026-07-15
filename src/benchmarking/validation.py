@@ -15,6 +15,67 @@ import ast
 from pathlib import Path
 
 
+from src.core.sandbox import SandboxManager
+
+from pathlib import Path
+
+
+
+_baseline_sandbox = SandboxManager()
+
+
+def verify_fault_is_observable(
+    target_file: Path,
+    test_file: Path,
+) -> None:
+    """
+    Ensure the intentionally faulty implementation fails its test suite.
+
+    A benchmark whose original target already passes cannot measure repair
+    capability and must be excluded as an infrastructure error.
+    """
+
+    target_file = target_file.resolve()
+    test_file = test_file.resolve()
+
+    original_code = target_file.read_text(
+        encoding="utf-8",
+    )
+
+    test_suite = test_file.read_text(
+        encoding="utf-8",
+    )
+
+    result = _baseline_sandbox.execute(
+        code=original_code,
+        test_suite=test_suite,
+    )
+
+    result_status = str(
+        getattr(
+            result,
+            "status",
+            "SUCCESS" if bool(getattr(result, "success", False)) else "FAILURE",
+        )
+    )
+
+    if result_status == "INFRASTRUCTURE_ERROR":
+        raise BenchmarkInfrastructureError(
+            "The benchmark baseline could not be executed because the "
+            "sandbox reported an infrastructure error.\n"
+            f"Target file: {target_file}\n"
+            f"Test file: {test_file}\n"
+            f"Output:\n{getattr(result, 'output', '')}\n"
+            f"Error:\n{getattr(result, 'error', '')}"
+        )
+
+    if bool(getattr(result, "success", False)):
+        raise BenchmarkInfrastructureError(
+            "The intentionally faulty benchmark target already passes its "
+            "test suite. At least one test must fail before repair.\n"
+            f"Target file: {target_file}\n"
+            f"Test file: {test_file}"
+        )
 class BenchmarkInfrastructureError(RuntimeError):
     """Raised when a benchmark definition is invalid."""
 

@@ -30,6 +30,7 @@ from src.benchmarking.models import (
 
 from src.benchmarking.validation import (
     BenchmarkInfrastructureError,
+    verify_fault_is_observable,
     verify_test_collection,
 )
 from src.reporting.exporter import export_experiment
@@ -366,6 +367,11 @@ def validate_discovered_benchmarks(
         try:
             collected_tests = verify_test_collection(
                 Path(task.test_file),
+            )
+            
+            verify_fault_is_observable(
+                target_file=Path(task.target_file),
+                test_file=Path(task.test_file),
             )
         except BenchmarkInfrastructureError as exc:
             infrastructure_errors.append(

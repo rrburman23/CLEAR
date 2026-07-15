@@ -20,6 +20,7 @@ from src.benchmarking.models import BenchmarkResult, BenchmarkTask
 from src.benchmarking.validation import (
     BenchmarkInfrastructureError,
     verify_test_collection,
+    verify_fault_is_observable,
 )
 
 from src.utils.diff import generate_patch
@@ -186,6 +187,10 @@ def execute_benchmark(
     # not evidence that the evaluated model failed to repair the program.
     try:
         collected_tests = verify_test_collection(test_path)
+        verify_fault_is_observable(
+            target_file=Path(task.target_file),
+            test_file=Path(task.test_file),
+        )
 
     except BenchmarkInfrastructureError as exc:
         raise BenchmarkInfrastructureError(

@@ -21,6 +21,7 @@ from src.benchmarking.models import BenchmarkResult
 if TYPE_CHECKING:
     import matplotlib.pyplot as plt
     import pandas as pd
+    import numpy as np
 
 
 # Centralized academic color palette for consistent model class presentation
@@ -278,7 +279,7 @@ def plot_success_rate_by_category(frame: Any, destination: Path, plt: Any) -> No
     figure, axis = plt.subplots(figsize=(max(10, len(values) * 0.85), 5))
     values.plot(kind="bar", ax=axis, color="#2ca02c", edgecolor="#116611", zorder=3)
     axis.set_title(
-        "Vulnerability Vulnerability/Fault Type Success Performance",
+        "Verified Repair Success Rate by Fault Category",
         fontsize=12,
         fontweight="bold",
         pad=15,
@@ -371,14 +372,12 @@ def plot_cumulative_success_by_iteration(
         )
 
     axis.set_title(
-        "Search Trajectory Optimization: Cumulative Success Rate by Iteration,)",
+        "Cumulative Verified Repair Success by Iteration)",
         fontsize=12,
         fontweight="bold",
         pad=15,
     )
-    axis.set_xlabel(
-        "Permitted ReAct Token/Tool Exploration Budget (k)", fontsize=10, labelpad=10
-    )
+    axis.set_xlabel("Repair Attempt Limit (k)", fontsize=10, labelpad=10)
     axis.set_ylabel("Cumulative Success Rate (%)", fontsize=10, labelpad=10)
     axis.set_xlim(1, max_iters)
     axis.set_ylim(0, 105)
@@ -485,55 +484,152 @@ def plot_failure_share_by_model(frame: Any, destination: Path, plt: Any) -> bool
     return True
 
 
-def plot_success_rate_ci_by_model(frame: Any, destination: Path, plt: Any) -> None:
-    """Success rate by model with Wilson 95% confidence intervals."""
+def plot_success_rate_ci_by_model(
+    frame: Any,
+    destination: Path,
+    plt: Any,
+) -> None:
+    """
+    Plot success rate by model with Wilson 95% confidence intervals.
+
+    Error distances are clamped to zero because floating-point rounding can
+    otherwise produce extremely small negative values at boundaries such as
+    a 100% observed success rate. Matplotlib rejects negative ``yerr`` values.
+    """
+
     grouped = frame.groupby("model")
-    models = []
-    rates = []
-    lower_errors = []
-    upper_errors = []
+
+    models: list[str] = []
+    rates: list[float] = []
+    lower_errors: list[float] = []
+    upper_errors: list[float] = []
 
     for model, group in grouped:
-        n = len(group)
-        s = int(group["passed"].sum())
-        rate = (s / n) * 100 if n else 0.0
-        lo, hi = _wilson_interval(s, n, z=1.96)
-        models.append(model)
-        rates.append(rate)
-        lower_errors.append(rate - lo * 100)
-        upper_errors.append(hi * 100 - rate)
+        sample_size = len(group)
+        successes = int(group["passed"].sum())
 
-    order = sorted(range(len(models)), key=lambda i: rates[i], reverse=True)
-    models = [models[i] for i in order]
-    rates = [rates[i] for i in order]
-    lower_errors = [lower_errors[i] for i in order]
-    upper_errors = [upper_errors[i] for i in order]
+        success_rate = (
+            (successes / sample_size) * 100.0
+            if sample_size
+            else 0.0
+        )
 
-    figure, axis = plt.subplots(figsize=(max(9, len(models) * 1.1), 5))
-    axis.bar(models, rates, color="#9467bd", edgecolor="#553388", zorder=3, alpha=0.8)
+        lower_bound, upper_bound = _wilson_interval(
+            successes=successes,
+            n=sample_size,
+            z=1.96,
+        )
+
+        lower_bound_percent = lower_bound * 100.0
+        upper_bound_percent = upper_bound * 100.0
+
+        # Floating-point arithmetic can produce values such as
+        # -1.42e-14 when the observed rate is exactly 100%.
+        lower_error = max(
+            0.0,
+            success_rate - lower_bound_percent,
+        )
+
+        upper_error = max(
+            0.0,
+            upper_bound_percent - success_rate,
+        )
+
+        models.append(str(model))
+        rates.append(success_rate)
+        lower_errors.append(lower_error)
+        upper_errors.append(upper_error)
+
+    order = sorted(
+        range(len(models)),
+        key=lambda index: rates[index],
+        reverse=True,
+    )
+
+    models = [models[index] for index in order]
+    rates = [rates[index] for index in order]
+    lower_errors = [lower_errors[index] for index in order]
+    upper_errors = [upper_errors[index] for index in order]
+
+    figure, axis = plt.subplots(
+        figsize=(
+            max(
+                9,
+                len(models) * 1.1,
+            ),
+            5,
+        )
+    )
+
+    axis.bar(
+        models,
+        rates,
+        color="#9467bd",
+        edgecolor="#553388",
+        alpha=0.8,
+        zorder=3,
+    )
+
     axis.errorbar(
         models,
         rates,
-        yerr=[lower_errors, upper_errors],
+        yerr=[
+            lower_errors,
+            upper_errors,
+        ],
         fmt="none",
         ecolor="#111111",
         capsize=4,
         elinewidth=1.2,
         zorder=4,
     )
+
     axis.set_title(
-        "Binomial Proportion Significance: Success Rate with Wilson 95% CI",
+        "Verified Repair Success Rate with Wilson 95% Confidence Intervals",
         fontsize=12,
         fontweight="bold",
         pad=15,
     )
-    axis.set_xlabel("Language Model Baseline", fontsize=10, labelpad=10)
-    axis.set_ylabel("Success Rate (%)", fontsize=10, labelpad=10)
-    axis.set_ylim(0, 105)
-    axis.grid(True, axis="y", linestyle="--", alpha=0.5, zorder=0)
-    axis.tick_params(axis="x", rotation=30, labelsize=9)
+
+    axis.set_xlabel(
+        "Language Model",
+        fontsize=10,
+        labelpad=10,
+    )
+
+    axis.set_ylabel(
+        "Success Rate (%)",
+        fontsize=10,
+        labelpad=10,
+    )
+
+    axis.set_ylim(
+        0,
+        105,
+    )
+
+    axis.grid(
+        True,
+        axis="y",
+        linestyle="--",
+        alpha=0.5,
+        zorder=0,
+    )
+
+    axis.tick_params(
+        axis="x",
+        rotation=30,
+        labelsize=9,
+    )
+
     figure.tight_layout()
-    figure.savefig(destination, dpi=300, bbox_inches="tight")
+
+    figure.savefig(
+        destination,
+        dpi=300,
+        bbox_inches="tight",
+    )
+
     plt.close(figure)
 
 
